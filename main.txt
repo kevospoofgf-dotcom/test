@@ -1,12 +1,21 @@
 """Block personal-data access via Frida (companion to nefd.py detector).
 
 Fixes applied:
-  - CreateProcess blocks now return ERROR_ACCESS_DENIED (5) instead of
+  - CreateProcess blocks return ERROR_ACCESS_DENIED (5) instead of
     ERROR_FILE_NOT_FOUND (2), which was tripping Defender's IFEO heuristic.
   - cmd.exe / python.exe removed from PROC_BLOCK_EXE_AND_ARG; their
     suspicious args are already caught by PROC_BLOCK_SUBSTR.
   - No admin required: script does NOT self-elevate and does NOT touch
-    Defender preferences. Run as normal user.
+    Defender preferences.
+  - Added hooks for elevation artifacts:
+      * UAC registry keys
+      * UserAssist (per-user execution log)
+      * AppInfo service keys
+      * FeatureUsage
+      * Defender detection-history resource keys
+      * RegSetValueExW/A layer so UserAssist / UAC writes are silently
+        discarded (return success, not error) instead of triggering
+        retries that would re-create the artifact.
   - Nothing is written to disk. All logging stays in an in-memory ring.
 """
 import frida
@@ -71,6 +80,7 @@ SENSITIVE_DIRS = [
 ]
 
 REG_BLOCK = [
+    # ---- Existing entries -------------------------------------------------
     "taskcache\\tree\\detectrun",
     "taskcache\\tree\\microsoft\\windows\\detectrun",
     "powershell\\psreadline",
@@ -99,6 +109,29 @@ REG_BLOCK = [
     "windows defender\\scans\\",
     "windows defender\\threats",
     "windows defender\\quarantine",
+
+    # ---- Elevation artifacts (source of "Executed As Administrator") ------
+    "\\windows\\currentversion\\uac",
+    "currentversion\\uac",
+    "\\policies\\system",
+    "enablelua",
+    "consentpromptbehavioradmin",
+    "promptonsecuredesktop",
+
+    # ---- UserAssist (per-user execution log, ROT13-encoded) ---------------
+    "\\explorer\\userassist",
+    "userassist",
+
+    # ---- AppInfo service (writes elevation operational events) ------------
+    "\\services\\appinfo",
+    "appinfo\\",
+
+    # ---- Execution history / process creation tracking --------------------
+    "\\microsoft\\windows\\currentversion\\explorer\\featureusage",
+    "featureusage",
+
+    # ---- Defender detection-history resource keys -------------------------
+    "windows defender\\scans\\history\\service\\detectionhistory\\resource",
 ]
 
 VALUE_BLOCK_NAMES = []
@@ -159,12 +192,11 @@ WEBVIEW2_ALLOW = [
 
 # =====================================================================
 # NO-DISK LOGGING: everything goes to a bounded in-memory ring buffer.
-# Nothing is ever written to Downloads or anywhere on disk.
 # =====================================================================
 _LOG_RING_SIZE = 5000
 _LOG_RING = []
 _LOG_RING_LOCK = threading.Lock()
-_VERBOSE = True   # keep True for console output before hiding
+_VERBOSE = True
 
 def log_line(s):
     """Append to in-memory ring only. Never touches disk."""
@@ -786,6 +818,27 @@ JS = r'''
                 blocked('RegQuery', this._d || '');
             });
         });
+
+        // ---- NEW: RegSetValueExW/A ------------------------------------
+        // UserAssist, UAC, AppInfo, FeatureUsage are written via SetValueEx.
+        // Return success (0) while discarding the write — returning an error
+        // causes Explorer / the elevating process to retry and the retry
+        // itself gets logged, which re-creates the artifact we want gone.
+        [['advapi32.dll', 'RegSetValueExW', true],
+         ['advapi32.dll', 'RegSetValueExA', false]].forEach(function (t) {
+            hook(t[0], t[1], function (a) {
+                var v = null; try { v = t[2] ? ws(a[1]) : as(a[1]); } catch (e) {}
+                var parent = lookupRegPath(a[0]);
+                this._b = shouldBlockReg(parent, v);
+                this._d = v;
+                this._parent = parent;
+            }, function (r) {
+                if (!this._b) return;
+                // Pretend success. Do NOT set a last-error here.
+                try { r.replace(0); } catch (e) {}
+                blocked('RegSet', (this._parent ? this._parent + '\\' : '') + (this._d || ''));
+            });
+        });
     }
 
     ['CreateProcessW', 'CreateProcessA'].forEach(function (n) {
@@ -958,7 +1011,6 @@ def main():
     # Run this from a normal (non-admin) cmd to avoid the
     # "Suspicious File Executed As Administrator Since Logon" alert.
 
-    # First: find the target process. Keep console visible while doing so.
     log_line(f'[*] Waiting for process with "{SUBSTR}" in exe name...')
     first = None
     while not first:
@@ -971,7 +1023,6 @@ def main():
     pid = first["pid"]
     log_line(f'[*] Attaching to PID {pid} ...')
 
-    # Attach + load guard. Any exception here = error, print in red and exit.
     try:
         session = frida.attach(pid)
         script = session.create_script(build_js())
@@ -981,7 +1032,6 @@ def main():
         print(f"\033[91mError: {e}\033[0m")
         sys.exit(1)
 
-    # Success path
     log_line("[*] Guard active.")
     _VERBOSE = False
     print()
@@ -992,7 +1042,6 @@ def main():
     except EOFError:
         pass
 
-    # Hide console and keep running in background
     hide_console()
 
     attached = {pid}
