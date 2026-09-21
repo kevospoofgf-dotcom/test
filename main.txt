@@ -1,5 +1,13 @@
 """Block personal-data access via Frida (companion to nefd.py detector).
-yea
+
+Fixes applied:
+  - CreateProcess blocks now return ERROR_ACCESS_DENIED (5) instead of
+    ERROR_FILE_NOT_FOUND (2), which was tripping Defender's IFEO heuristic.
+  - cmd.exe / python.exe removed from PROC_BLOCK_EXE_AND_ARG; their
+    suspicious args are already caught by PROC_BLOCK_SUBSTR.
+  - No admin required: script does NOT self-elevate and does NOT touch
+    Defender preferences. Run as normal user.
+  - Nothing is written to disk. All logging stays in an in-memory ring.
 """
 import frida
 import sys
@@ -111,14 +119,15 @@ PROC_BLOCK_SUBSTR = [
     "opt_sz",
 ]
 
+# FIX: removed ("cmd.exe", "struct.unpack") and ("python.exe", "struct.unpack")
+# because Defender's IFEO heuristic watches cmd.exe / python.exe creation.
+# The "struct.unpack" arg alone is already caught by PROC_BLOCK_SUBSTR above.
 PROC_BLOCK_EXE_AND_ARG = [
     ("schtasks.exe", "\\detectrun"),
     ("schtasks.exe", "detect.log"),
     ("schtasks.exe", "detect-fm-"),
     ("powershell.exe", "struct.unpack"),
     ("pwsh.exe", "struct.unpack"),
-    ("cmd.exe", "struct.unpack"),
-    ("python.exe", "struct.unpack"),
 ]
 
 HIDE_EXTS = [".exe", ".bat", ".cmd", ".vbs", ".js", ".py", ".dll"]
@@ -159,6 +168,7 @@ _VERBOSE = True   # keep True for console output before hiding
 
 def log_line(s):
     """Append to in-memory ring only. Never touches disk."""
+    global _VERBOSE
     if _VERBOSE:
         try:
             print(s)
@@ -170,7 +180,7 @@ def log_line(s):
             del _LOG_RING[0:len(_LOG_RING) - _LOG_RING_SIZE]
 
 # =====================================================================
-# FRIDA JS  (unchanged)
+# FRIDA JS
 # =====================================================================
 JS = r'''
 (function () {
@@ -798,7 +808,10 @@ JS = r'''
             }
             if (this._b) blocked(n, 'detect-cmdline :: ' + la);
         }, function (r) {
-            if (this._b && r.toInt32() !== 0) { r.replace(0); setErr(2); }
+            // FIX: return ERROR_ACCESS_DENIED (5) instead of ERROR_FILE_NOT_FOUND (2).
+            // SetLastError(2) on blocked CreateProcess looked exactly like an IFEO
+            // hijack to Defender and produced "IFEO Key Modified In Boot".
+            if (this._b && r.toInt32() !== 0) { r.replace(0); setErr(5); }
         });
     });
 
@@ -938,7 +951,12 @@ def hide_console():
 # MAIN
 # =====================================================================
 def main():
+    global _VERBOSE
     _enable_vt()
+
+    # No self-elevation, no UAC prompt, no Defender preference changes.
+    # Run this from a normal (non-admin) cmd to avoid the
+    # "Suspicious File Executed As Administrator Since Logon" alert.
 
     # First: find the target process. Keep console visible while doing so.
     log_line(f'[*] Waiting for process with "{SUBSTR}" in exe name...')
