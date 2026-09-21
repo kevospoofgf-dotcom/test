@@ -1,0 +1,1017 @@
+"""Block personal-data access via Frida (companion to nefd.py detector).
+yea
+"""
+import frida
+import sys
+import time
+import os
+import json
+import threading
+import queue
+import psutil
+import ctypes
+
+# =====================================================================
+# CONFIG
+# =====================================================================
+
+SUBSTR = "detect"
+
+BLOCK_EVENTLOG         = True
+BLOCK_PREFETCH         = True
+BLOCK_DATAUSAGE        = True
+BLOCK_REGISTRY         = True
+STRICT_REGISTRY        = False
+BLOCK_AUTORUN          = True
+BLOCK_HISTORY          = True
+BLOCK_ELEVATED_LOGS    = True
+BLOCK_DNSCACHE_DPS     = True
+BLOCK_SECURITY_USN     = True
+BLOCK_USB              = True
+BLOCK_BROWSER_HISTORY  = True
+BLOCK_TASKS_COM        = True
+BLOCK_WMI              = True
+
+# ---- Exact-basename artifacts hidden from every filesystem API.
+HIDDEN_NAMES = [
+    "detect.log",
+    "detect-fm.log",
+    "detect-fm-37713147.exe",
+    "consolehost_history.txt",
+    "setupapi.dev.log",
+    "setupapi.app.log",
+    "setupapi.offline.log",
+]
+
+HIDDEN_TASK_NAMES = [
+    "detectrun",
+]
+
+SENSITIVE_DIRS = [
+    "system32\\tasks",
+    "syswow64\\tasks",
+    "\\windows\\prefetch",
+    "\\windows\\system32\\winevt",
+    "\\windows\\system32\\winevt\\logs",
+    "\\microsoft\\windows\\powershell\\psreadline",
+    "\\windows defender\\scans\\history",
+    "\\windows defender\\scans\\history\\service",
+    "\\windows defender\\scans\\history\\results",
+    "\\windows defender\\scans\\history\\store",
+    "\\windows defender\\scans\\history\\service\\detectionhistory",
+    "\\windows defender\\scans\\history\\service\\detectionhistory\\file",
+]
+
+REG_BLOCK = [
+    "taskcache\\tree\\detectrun",
+    "taskcache\\tree\\microsoft\\windows\\detectrun",
+    "powershell\\psreadline",
+    "club44",
+    "bypass",
+    "\\bam\\state\\usersettings",
+    "\\bam\\state",
+    "\\services\\bam\\",
+    "\\services\\dam\\",
+    "appcompatcache",
+    "shimcache",
+    "amcache",
+    "\\enum\\usbstor",
+    "\\enum\\usb",
+    "\\enum\\usbprint",
+    "\\enum\\wpd",
+    "usbflags",
+    "mountmgr",
+    "\\services\\usbhub",
+    "\\services\\usbstor",
+    "\\services\\usbccgp",
+    "emDMgmt",
+    "\\emdm gmt",
+    "\\emDMgmt",
+    "windows defender\\scans\\history",
+    "windows defender\\scans\\",
+    "windows defender\\threats",
+    "windows defender\\quarantine",
+]
+
+VALUE_BLOCK_NAMES = []
+
+REG_ALLOW = [
+    "winsock", "tcpip", "dnsclient", "cryptography", "securityproviders",
+    "lsa", "ctf", "edgeupdate", "edge\\webview", "edgewebview", "wintrust",
+    "systemcertificates", "control\\ci\\", "session manager\\environment",
+    "volatile environment", "localization", "nls",
+]
+
+PROC_BLOCK_SUBSTR = [
+    "\\detectrun",
+    "detect-fm-",
+    "detect.log",
+    "struct.unpack",
+    "e_lfanew",
+    "opt_sz",
+]
+
+PROC_BLOCK_EXE_AND_ARG = [
+    ("schtasks.exe", "\\detectrun"),
+    ("schtasks.exe", "detect.log"),
+    ("schtasks.exe", "detect-fm-"),
+    ("powershell.exe", "struct.unpack"),
+    ("pwsh.exe", "struct.unpack"),
+    ("cmd.exe", "struct.unpack"),
+    ("python.exe", "struct.unpack"),
+]
+
+HIDE_EXTS = [".exe", ".bat", ".cmd", ".vbs", ".js", ".py", ".dll"]
+EXT_ALLOW = [
+    "edgewebview", "msedge", "webview",
+    "detect-fm", "\\detect",
+    "\\system32\\", "\\syswow64\\",
+    "\\winsxs\\", "\\windowspowershell\\",
+    "\\catroot", "\\catroot2",
+    "kd_", "kdstub", "bootres",
+]
+
+WEBVIEW2_ALLOW = [
+    "\\program files (x86)\\microsoft\\edgewebview\\",
+    "\\program files\\microsoft\\edgewebview\\",
+    "\\program files (x86)\\microsoft\\edge\\application\\",
+    "\\program files\\microsoft\\edge\\application\\",
+    "\\program files (x86)\\microsoft\\edgecore\\",
+    "\\program files\\microsoft\\edgecore\\",
+    "\\windows\\system32\\webview2loader.dll",
+    "\\microsoft\\edgeupdate\\",
+    "microsoft\\edgeupdate\\clients",
+    "microsoft\\edgeupdate\\clientstate",
+    "microsoft\\edgewebview",
+    "\\edgeupdate\\",
+    "\\edgeupdatem\\",
+    "microsoft\\edge\\blbeacon",
+]
+
+# =====================================================================
+# NO-DISK LOGGING: everything goes to a bounded in-memory ring buffer.
+# Nothing is ever written to Downloads or anywhere on disk.
+# =====================================================================
+_LOG_RING_SIZE = 5000
+_LOG_RING = []
+_LOG_RING_LOCK = threading.Lock()
+_VERBOSE = True   # keep True for console output before hiding
+
+def log_line(s):
+    """Append to in-memory ring only. Never touches disk."""
+    if _VERBOSE:
+        try:
+            print(s)
+        except Exception:
+            pass
+    with _LOG_RING_LOCK:
+        _LOG_RING.append(s)
+        if len(_LOG_RING) > _LOG_RING_SIZE:
+            del _LOG_RING[0:len(_LOG_RING) - _LOG_RING_SIZE]
+
+# =====================================================================
+# FRIDA JS  (unchanged)
+# =====================================================================
+JS = r'''
+(function () {
+    var C = {
+        eventlog: %EVENTLOG%,
+        prefetch: %PREFETCH%,
+        datausage: %DATAUSAGE%,
+        registry: %REGISTRY%,
+        strictReg: %STRICTREG%,
+        autorun: %AUTORUN%,
+        history: %HISTORY%,
+        elevated: %ELEVATED%,
+        dnsdps: %DNSDPS%,
+        usn: %USN%,
+        usb: %USB%,
+        browser: %BROWSER%,
+        tasksCom: %TASKCOM%,
+        wmi: %WMI%,
+        regBlock: %REGBLOCK%,
+        regAllow: %REGALLOW%,
+        valueBlockNames: %VALUEBLOCK%,
+        hideExts: %HIDEEXTS%,
+        extAllow: %EXTALLOW%,
+        wv2Allow: %WV2ALLOW%,
+        hiddenNames: %HIDDENNAMES%,
+        hiddenTaskNames: %HIDDENTASKNAMES%,
+        sensitiveDirs: %SENSITIVEDIRS%,
+        procBlockSubstr: %PROCBLOCKSUBSTR%,
+        procBlockExeAndArg: %PROCBLOCKEXEARG%
+    };
+    function log(m) { send({ type: 'info', message: m }); }
+
+    var _blockedCounts = {};
+    var _blockedKeyStart = {};
+    function blocked(api, detail) {
+        var key = api + '|' + (detail || '');
+        var now = Date.now();
+        if (!_blockedKeyStart[key] || now - _blockedKeyStart[key] > 1000) {
+            _blockedKeyStart[key] = now;
+            _blockedCounts[key] = 0;
+        }
+        var n = (_blockedCounts[key] = _blockedCounts[key] + 1);
+        if (n <= 3 || (n % 50) === 0) {
+            send({ type: 'blocked', api: api, detail: (detail || '') + (n > 1 ? ' (x' + n + ')' : '') });
+        }
+    }
+
+    function hook(modName, fnName, onEnter, onLeave) {
+        var addr = null;
+        try { addr = Module.getExportByName(modName, fnName); }
+        catch (e) { try { addr = Process.getModuleByName(modName).findExportByName(fnName); } catch (e2) {} }
+        if (!addr) { log("[MISS] " + modName + "!" + fnName); return; }
+        log("[GUARD] " + modName + "!" + fnName);
+        Interceptor.attach(addr, {
+            onEnter: function (a) { try { if (onEnter) onEnter.call(this, a); } catch (e) { send({ type: 'error', message: '' + e }); } },
+            onLeave: function (r) { try { if (onLeave) onLeave.call(this, r); } catch (e) { send({ type: 'error', message: '' + e }); } }
+        });
+    }
+    function ws(p) { if (p.isNull()) return null; try { return p.readUtf16String(); } catch (e) { return null; } }
+    function as(p) { if (p.isNull()) return null; try { return p.readAnsiString(); } catch (e) { return null; } }
+    function low(s) { return (s || '').toLowerCase(); }
+    function setErr(v) { try { new NativeFunction(Module.getExportByName('kernel32.dll', 'SetLastError'), 'void', ['uint32'])(v); } catch (e) {} }
+
+    function zeroMem(p, requested, capacity) {
+        if (p.isNull() || !requested || requested <= 0) return;
+        var cap = (typeof capacity === 'number' && capacity > 0) ? capacity : requested;
+        var n = Math.min(requested, cap);
+        if (n <= 0 || n > 8 * 1024 * 1024) return;
+        try { Memory.fill(p, n, 0); return; } catch (e) {}
+        try { p.writeByteArray(new Array(Math.min(n, 4096)).fill(0)); } catch (e2) {}
+    }
+
+    function closeH(h) { try { new NativeFunction(Module.getExportByName('kernel32.dll', 'CloseHandle'), 'bool', ['pointer'])(h); } catch (e) {} }
+    function findClose(h) { try { new NativeFunction(Module.getExportByName('kernel32.dll', 'FindClose'), 'bool', ['pointer'])(h); } catch (e) {} }
+    function regClose(h) { try { new NativeFunction(Module.getExportByName('advapi32.dll', 'RegCloseKey'), 'long', ['pointer'])(h); } catch (e) {} }
+    function evtClose(h) { try { new NativeFunction(Module.getExportByName('wevtapi.dll', 'EvtClose'), 'bool', ['pointer'])(h); } catch (e) {} }
+    function closeEvtLog(h) { try { new NativeFunction(Module.getExportByName('advapi32.dll', 'CloseEventLog'), 'bool', ['pointer'])(h); } catch (e) {} }
+    function ntClose(h) { try { new NativeFunction(Module.getExportByName('ntdll.dll', 'NtClose'), 'long', ['pointer'])(h); } catch (e) {} }
+    function isInvalidHandle(v) {
+        try { return v.equals(ptr('-1')); } catch (e) { return false; }
+    }
+    function basenameOf(l) {
+        var i = l.lastIndexOf('\\');
+        return i >= 0 ? l.substring(i + 1) : l;
+    }
+
+    function isWebView2(s) {
+        if (!s) return false;
+        var l = low(s).split('/').join('\\');
+        for (var i = 0; i < C.wv2Allow.length; i++) if (l.indexOf(C.wv2Allow[i]) >= 0) return true;
+        return false;
+    }
+    function isHiddenName(s) {
+        if (!s) return false;
+        var l = low(s).split('/').join('\\');
+        var base = basenameOf(l);
+        for (var i = 0; i < C.hiddenNames.length; i++) {
+            if (base === C.hiddenNames[i]) return true;
+        }
+        return false;
+    }
+    function isHiddenTaskName(s) {
+        if (!s) return false;
+        var l = low(s).split('/').join('\\');
+        if (l.indexOf('\\tasks\\') < 0) return false;
+        var base = basenameOf(l);
+        for (var i = 0; i < C.hiddenTaskNames.length; i++) {
+            if (base === C.hiddenTaskNames[i]) return true;
+        }
+        return false;
+    }
+    function stripNtPrefix(l) {
+        if (l.indexOf('\\??\\') === 0) l = l.substring(4);
+        var m = l.match(/^\\device\\harddiskvolume\d+(\\|$)/);
+        if (m) {
+            l = l.substring(m[0].length - 1);
+            if (l.charAt(0) !== '\\') l = '\\' + l;
+        }
+        return l;
+    }
+    function normPath(s) {
+        var l = low(s).split('/').join('\\');
+        return stripNtPrefix(l);
+    }
+    function isDirItself(l) {
+        for (var di = 0; di < C.sensitiveDirs.length; di++) {
+            var d = C.sensitiveDirs[di];
+            if (l.endsWith(d) || l.endsWith(d + '\\')) return true;
+        }
+        return false;
+    }
+
+    function isBlockedFile(s) {
+        if (!s) return null;
+        if (isWebView2(s)) return null;
+        var l = normPath(s);
+
+        if (isHiddenName(l)) return 'hidden-artifact';
+        if (isHiddenTaskName(l)) return 'autorun-task';
+
+        if (l.indexOf('detect-fm-') >= 0 && l.endsWith('.exe')) return 'detect-exe';
+
+        if (l.indexOf('club44') >= 0 &&
+            (l.endsWith('.exe') || l.endsWith('.dll') || l.endsWith('.sys') ||
+             l.endsWith('.cer') || l.endsWith('.crt') || l.endsWith('.pfx')))
+            return 'club44-remnant';
+        if (l.indexOf('bypass') >= 0 &&
+            (l.endsWith('.exe') || l.endsWith('.dll') || l.endsWith('.sys') ||
+             l.endsWith('.cer') || l.endsWith('.crt')))
+            return 'bypass-remnant';
+
+        if (C.prefetch && l.indexOf('\\prefetch\\') >= 0) return 'prefetch';
+
+        if (C.eventlog && l.indexOf('\\winevt\\') >= 0) return 'eventlog-file';
+
+        if (C.datausage && (l.indexOf('\\sru\\') >= 0 || l.indexOf('srudb.dat') >= 0 || l.indexOf('srumpe2scan') >= 0)) return 'datausage-sru';
+
+        var BROWSER_SUBSTR = [
+            '\\google\\chrome\\user data', '\\microsoft\\edge\\user data',
+            '\\bravesoftware\\brave-browser\\user data',
+            '\\opera software\\opera stable', '\\opera software\\opera',
+            '\\vivaldi\\user data', '\\mozilla\\firefox\\profiles'
+        ];
+        var BROWSER_FILES = ['history', 'history-journal', 'history-wal', 'history-shm',
+            'top sites', 'top sites-journal', 'visited links', 'web data', 'web data-journal',
+            'network action predictor', 'favicons', 'favicons-journal', 'login data',
+            'login data-journal', 'bookmarks', 'bookmarks.bak', 'downloads',
+            'places.sqlite', 'places.sqlite-journal', 'places.sqlite-wal', 'places.sqlite-shm',
+            'downloads.sqlite', 'formhistory.sqlite', 'cookies.sqlite', 'favicons.sqlite',
+            'webappsstore.sqlite', 'prefs.js', 'sessionstore.js', 'sessionstore-backups'];
+        if (C.browser) {
+            var hitDir = false;
+            for (var i = 0; i < BROWSER_SUBSTR.length; i++) if (l.indexOf(BROWSER_SUBSTR[i]) >= 0) { hitDir = true; break; }
+            if (hitDir) {
+                var base = basenameOf(l);
+                for (var j = 0; j < BROWSER_FILES.length; j++) if (base === BROWSER_FILES[j]) return 'browser-history';
+            }
+        }
+        return null;
+    }
+
+    function shouldBlockReg(parentPath, val) {
+        if (!C.registry) return false;
+        var combined = low((parentPath || '')) + '|' + low((val || ''));
+        if (isWebView2(combined)) return false;
+        for (var i = 0; i < C.regBlock.length; i++) {
+            if (combined.indexOf(C.regBlock[i]) >= 0) return true;
+        }
+        return false;
+    }
+
+    function ntPath(oa) {
+        try {
+            if (oa.isNull()) return null;
+            var off = Process.pointerSize === 8 ? 8 : 4;
+            var us = oa.add(Process.pointerSize * 2).readPointer();
+            if (us.isNull()) return null;
+            var len = us.readU16();
+            if (!len || len > 2048) return null;
+            var buf = us.add(off).readPointer();
+            if (buf.isNull()) return null;
+            return buf.readUtf16String(len / 2);
+        } catch (e) { return null; }
+    }
+
+    var regHandlePaths = {};
+    function recordRegHandle(h, path) {
+        try { if (h.isNull()) return; regHandlePaths[h.toString()] = path || ''; } catch (e) {}
+    }
+    function lookupRegPath(h) {
+        try { if (h.isNull()) return null; return regHandlePaths[h.toString()] || null; } catch (e) { return null; }
+    }
+    var _is64 = (Process.pointerSize === 8);
+    recordRegHandle(ptr(_is64 ? '0xffffffff80000000' : '0x80000000'), 'hklm');
+    recordRegHandle(ptr(_is64 ? '0xffffffff80000001' : '0x80000001'), 'hkcu');
+    recordRegHandle(ptr(_is64 ? '0xffffffff80000002' : '0x80000002'), 'hkcr');
+    recordRegHandle(ptr(_is64 ? '0xffffffff80000003' : '0x80000003'), 'hku');
+    recordRegHandle(ptr(_is64 ? '0xffffffff80000005' : '0x80000005'), 'hkcc');
+
+    function trackRegOpenEnter(isW) {
+        return function (a) {
+            var hRoot = a[0];
+            var sub = null; try { sub = isW ? ws(a[1]) : as(a[1]); } catch (e) {}
+            var rootPath = lookupRegPath(hRoot) || 'root';
+            this._fullPath = rootPath + '\\' + (sub || '');
+            this._ph = null;
+            try { this._ph = a[4]; } catch (e) {}
+        };
+    }
+    function trackRegOpenLeave(a) {
+        try {
+            if (a.toInt32() === 0 && this._ph && !this._ph.isNull()) {
+                var h = this._ph.readPointer();
+                if (h && !h.isNull()) recordRegHandle(h, this._fullPath);
+            }
+        } catch (e) {}
+    }
+    [['advapi32.dll', 'RegOpenKeyExW', true], ['advapi32.dll', 'RegOpenKeyExA', false],
+     ['advapi32.dll', 'RegOpenKeyW', true], ['advapi32.dll', 'RegOpenKeyA', false],
+     ['advapi32.dll', 'RegCreateKeyExW', true], ['advapi32.dll', 'RegCreateKeyExA', false]].forEach(function (t) {
+        hook(t[0], t[1], trackRegOpenEnter(t[2]), trackRegOpenLeave);
+    });
+    hook('advapi32.dll', 'RegCloseKey', function (a) {
+        try { delete regHandlePaths[a[0].toString()]; } catch (e) {}
+    }, null);
+
+    if (C.eventlog) {
+        ['EvtQuery', 'EvtSubscribe', 'EvtOpenLog'].forEach(function (n) {
+            hook('wevtapi.dll', n, function (a) {
+                try { this._d = ws(a[1]) || as(a[1]); } catch (e) { this._d = null; }
+                this._b = true;
+            }, function (r) {
+                if (this._b && !r.isNull()) {
+                    try { evtClose(r); } catch (e) {}
+                    r.replace(ptr(0)); setErr(5); blocked(n, this._d || '');
+                }
+            });
+        });
+        hook('wevtapi.dll', 'EvtNext', function (a) {
+            this._pRet = a[5];
+        }, function (r) {
+            if (r.toInt32() === 0) return;
+            try { if (this._pRet && !this._pRet.isNull()) this._pRet.writeU32(0); } catch (e) {}
+            r.replace(0); setErr(5); blocked('EvtNext', '');
+        });
+        hook('wevtapi.dll', 'EvtRender', function (a) {
+            this._buf = a[4]; this._pn = a[5];
+        }, function (r) {
+            if (r.toInt32() === 0) return;
+            try {
+                if (this._pn && !this._pn.isNull()) {
+                    var n = this._pn.readU32();
+                    if (n) zeroMem(this._buf, n, n);
+                    this._pn.writeU32(0);
+                }
+            } catch (e) {}
+            r.replace(0); setErr(5); blocked('EvtRender', '');
+        });
+        ['OpenEventLogW', 'OpenEventLogA', 'OpenBackupEventLogW', 'OpenBackupEventLogA'].forEach(function (n) {
+            var isW = n.endsWith('W');
+            hook('advapi32.dll', n, function (a) {
+                try { this._d = isW ? ws(a[1]) : as(a[1]); } catch (e) { this._d = null; }
+            }, function (r) {
+                if (!r.isNull()) { try { closeEvtLog(r); } catch (e) {} r.replace(ptr(0)); setErr(5); blocked(n, this._d || ''); }
+            });
+        });
+        ['ReadEventLogW', 'ReadEventLogA'].forEach(function (n) {
+            hook('advapi32.dll', n, function (a) { this._buf = a[3]; this._pn = a[5]; }, function (r) {
+                if (r.toInt32() === 0) return;
+                try {
+                    if (this._pn && !this._pn.isNull()) {
+                        var n2 = this._pn.readU32();
+                        if (n2) zeroMem(this._buf, n2, n2);
+                        this._pn.writeU32(0);
+                    }
+                } catch (e) {}
+                r.replace(0); setErr(5); blocked(n, '');
+            });
+        });
+        ['GetNumberOfEventLogRecords', 'GetOldestEventLogRecord', 'NotifyChangeEventLog',
+         'BackupEventLogW', 'BackupEventLogA', 'ClearEventLogW', 'ClearEventLogA'].forEach(function (n) {
+            hook('advapi32.dll', n, function (a) {}, function (r) {
+                if (r.toInt32() !== 0) { r.replace(0); setErr(5); blocked(n, ''); }
+            });
+        });
+    }
+
+    function fileEnter(isW) {
+        return function (a) {
+            var p = null; try { p = isW ? ws(a[0]) : as(a[0]); } catch (e) {}
+            this._reason = isBlockedFile(p); this._path = p;
+            if (this._reason) blocked('CreateFile', this._reason + ' :: ' + p);
+        };
+    }
+    function fileLeave(a) {
+        if (!this._reason) return;
+        try { if (!isInvalidHandle(a)) closeH(a); } catch (e) {}
+        a.replace(ptr(-1)); setErr(5);
+    }
+    hook('kernel32.dll', 'CreateFileW', fileEnter(true), fileLeave);
+    hook('kernel32.dll', 'CreateFileA', fileEnter(false), fileLeave);
+
+    function findNameW(dp) { try { if (dp.isNull()) return null; return dp.add(44).readUtf16String(); } catch (e) { return null; } }
+    function findNameA(dp) { try { if (dp.isNull()) return null; return dp.add(44).readAnsiString(); } catch (e) { return null; } }
+
+    function isExtHidden(name, dir) {
+        if (!name || name === '.' || name === '..') return false;
+        var full = (dir || '') + '\\' + name;
+        if (isWebView2(full)) return false;
+        var l = low(name);
+        var ctx = low(full);
+        if (isHiddenName(ctx)) return true;
+        if (isHiddenTaskName(ctx)) return true;
+        if (ctx.indexOf('\\prefetch\\') >= 0) return true;
+        if (ctx.indexOf('\\winevt\\') >= 0 && l.endsWith('.evtx')) return true;
+        return false;
+    }
+
+    var findHandleDirs = {};
+    var findPoisoned = {};
+
+    function findEnter(isW, dpIdx) {
+        return function (a) {
+            var p = null; try { p = isW ? ws(a[0]) : as(a[0]); } catch (e) {}
+            this._reason = isBlockedFile(p); this._path = p; this._dir = p;
+            this._isW = isW;
+            try { this._dp = a[dpIdx]; } catch (e2) { this._dp = null; }
+            if (this._reason) blocked('FindFirst', this._reason + ' :: ' + p);
+        };
+    }
+    function findLeave(a) {
+        if (this._reason) {
+            try { if (!isInvalidHandle(a)) findClose(a); } catch (e) {}
+            a.replace(ptr(-1)); setErr(5);
+            return;
+        }
+        if (isInvalidHandle(a)) return;
+        try {
+            var key = a.toString();
+            findHandleDirs[key] = this._dir || '';
+        } catch (e) {}
+    }
+    hook('kernel32.dll', 'FindFirstFileW', findEnter(true, 1), findLeave);
+    hook('kernel32.dll', 'FindFirstFileA', findEnter(false, 1), findLeave);
+    hook('kernel32.dll', 'FindFirstFileExW', findEnter(true, 2), findLeave);
+    hook('kernel32.dll', 'FindFirstFileExA', findEnter(false, 2), findLeave);
+
+    function findNextEnter(isW) {
+        return function (a) {
+            this._h = a[0]; this._dp = a[1]; this._isW = isW;
+            this._key = a[0].toString();
+            this._dir = findHandleDirs[this._key] || '';
+            this._poisoned = !!findPoisoned[this._key];
+        };
+    }
+    function findNextLeave(r) {
+        if (this._poisoned) {
+            try { r.replace(0); setErr(18); } catch (e) {}
+            return;
+        }
+        if (r.toInt32() === 0) return;
+        try {
+            var nm = this._isW ? findNameW(this._dp) : findNameA(this._dp);
+            if (isExtHidden(nm, this._dir)) {
+                findPoisoned[this._key] = true;
+                blocked('FindFilter', (this._dir ? this._dir + ' :: ' : '') + nm);
+                r.replace(0); setErr(18);
+            }
+        } catch (e) {}
+    }
+    hook('kernel32.dll', 'FindNextFileW', findNextEnter(true), findNextLeave);
+    hook('kernel32.dll', 'FindNextFileA', findNextEnter(false), findNextLeave);
+    hook('kernel32.dll', 'FindClose', function (a) {
+        try { delete findHandleDirs[a[0].toString()]; } catch (e) {}
+        try { delete findPoisoned[a[0].toString()]; } catch (e) {}
+    }, null);
+
+    function attrEnter(isW) {
+        return function (a) { var p = null; try { p = isW ? ws(a[0]) : as(a[0]); } catch (e) {} this._reason = isBlockedFile(p); if (this._reason) blocked('GetFileAttr', this._reason + ' :: ' + p); };
+    }
+    hook('kernel32.dll', 'GetFileAttributesW', attrEnter(true), function (r) { if (this._reason) { r.replace(0xFFFFFFFF); setErr(5); } });
+    hook('kernel32.dll', 'GetFileAttributesA', attrEnter(false), function (r) { if (this._reason) { r.replace(0xFFFFFFFF); setErr(5); } });
+    hook('kernel32.dll', 'GetFileAttributesExW', attrEnter(true), function (r) { if (this._reason) { r.replace(0); setErr(5); } });
+    hook('kernel32.dll', 'GetFileAttributesExA', attrEnter(false), function (r) { if (this._reason) { r.replace(0); setErr(5); } });
+    ['CopyFileW', 'CopyFileA', 'CopyFileExW', 'CopyFileExA'].forEach(function (n) {
+        var isW = n.endsWith('W') || n.endsWith('ExW');
+        hook('kernel32.dll', n, function (a) {
+            var s = null, d = null;
+            try { s = isW ? ws(a[0]) : as(a[0]); d = isW ? ws(a[1]) : as(a[1]); } catch (e) {}
+            this._reason = isBlockedFile(s) || isBlockedFile(d);
+            if (this._reason) blocked(n, (s || '') + ' -> ' + (d || ''));
+        }, function (r) { if (this._reason && r.toInt32() !== 0) { r.replace(0); setErr(5); } });
+    });
+
+    ['NtOpenFile', 'NtCreateFile', 'ZwOpenFile', 'ZwCreateFile'].forEach(function (n) {
+        hook('ntdll.dll', n, function (a) {
+            var p = null; try { p = ntPath(a[2]); } catch (e) {}
+            this._reason = isBlockedFile(p); this._ph = a[0]; this._path = p;
+            if (this._reason) blocked(n, this._reason + ' :: ' + p);
+        }, function (r) {
+            if (this._reason) {
+                try {
+                    var v = r.toInt32();
+                    if ((v & 0xC0000000) === 0) {
+                        try { var h = this._ph.readPointer(); if (!h.isNull()) ntClose(h); } catch (e) {}
+                        try { this._ph.writePointer(ptr(0)); } catch (e2) {}
+                    }
+                } catch (e) {}
+                r.replace(0xC0000022);
+            }
+        });
+    });
+
+    var FSCTL_READ_USN_JOURNAL     = 0x000900BB;
+    var FSCTL_ENUM_USN_DATA        = 0x000900B3;
+    var FSCTL_QUERY_USN_JOURNAL    = 0x000900F4;
+    var FSCTL_READ_FILE_USN_DATA   = 0x000900EB;
+    var FSCTL_CREATE_USN_JOURNAL   = 0x000900E7;
+    var USN_JOURNAL_DATA_SIZE = 64;
+    if (C.usn) {
+        hook('kernel32.dll', 'DeviceIoControl', function (a) {
+            var code = 0; try { code = a[1].toInt32() >>> 0; } catch (e) {}
+            this._code = code;
+            this._out = a[4];
+            this._outSz = a[5].toInt32();
+            this._pRet = a[6];
+            this._usnQuery = code === FSCTL_QUERY_USN_JOURNAL;
+            this._usnRead  = (code === FSCTL_READ_USN_JOURNAL ||
+                              code === FSCTL_ENUM_USN_DATA ||
+                              code === FSCTL_READ_FILE_USN_DATA);
+            this._usnCreate = code === FSCTL_CREATE_USN_JOURNAL;
+        }, function (r) {
+            if (this._usnQuery) {
+                try {
+                    if (!this._out.isNull() && this._outSz > 0) {
+                        var n = Math.min(this._outSz, USN_JOURNAL_DATA_SIZE);
+                        if (n > 0) zeroMem(this._out, n, n);
+                        if (n >= 56) {
+                            this._out.add(40).writeU64(0x1000000);
+                            this._out.add(48).writeU64(0x400000);
+                        }
+                        if (this._pRet && !this._pRet.isNull()) this._pRet.writeU32(n);
+                    }
+                } catch (e) {}
+                r.replace(1);
+                blocked('DeviceIoControl', 'USN query -> empty header');
+                return;
+            }
+            if (this._usnRead) {
+                try {
+                    if (!this._out.isNull() && this._outSz > 0) {
+                        var n2 = Math.min(this._outSz, 8);
+                        if (n2 > 0) zeroMem(this._out, n2, n2);
+                        if (this._pRet && !this._pRet.isNull()) this._pRet.writeU32(n2);
+                    }
+                } catch (e) {}
+                r.replace(1);
+                blocked('DeviceIoControl', 'USN read -> 0 records');
+                return;
+            }
+            if (this._usnCreate) {
+                r.replace(1);
+                blocked('DeviceIoControl', 'USN create -> ignored');
+            }
+        });
+        hook('kernel32.dll', 'ReadDirectoryChangesW', function (a) {
+            this._pRet = a[5];
+        }, function (r) {
+            try { if (this._pRet && !this._pRet.isNull()) this._pRet.writeU32(0); } catch (e) {}
+            r.replace(1);
+            blocked('ReadDirectoryChangesW', 'quiet');
+        });
+    }
+
+    var systemDrive = null;
+    try {
+        var _buf = Memory.alloc(260 * 2);
+        var _n = new NativeFunction(
+            Module.getExportByName('kernel32.dll', 'GetWindowsDirectoryW'),
+            'uint32', ['pointer', 'uint32']
+        )(_buf, 260);
+        if (_n > 0 && _n < 260) {
+            var _winDir = _buf.readUtf16String();
+            if (_winDir && _winDir.length >= 2) systemDrive = _winDir.substring(0, 2).toLowerCase();
+        }
+    } catch (e) { log("[!] systemDrive probe failed: " + e); }
+    log("[*] systemDrive = " + systemDrive);
+
+    var _driveMask = 0;
+    var _driveMaskTs = 0;
+    function refreshDriveMask() {
+        var now = Date.now();
+        if (now - _driveMaskTs < 5000 && _driveMask !== 0) return;
+        try {
+            var f = new NativeFunction(
+                Module.getExportByName('kernel32.dll', 'GetLogicalDrives'),
+                'uint32', []
+            );
+            _driveMask = f() >>> 0;
+            _driveMaskTs = now;
+        } catch (e) { _driveMask = 1; }
+    }
+    function letterExists(letter) {
+        var idx = letter.charCodeAt(0) - 97;
+        if (idx < 0 || idx > 25) return false;
+        return (_driveMask & (1 << idx)) !== 0;
+    }
+    if (C.usb) {
+        hook('kernel32.dll', 'GetDriveTypeW', function (a) { this._d = ws(a[0]); }, function (r) {
+            var l = normPath(this._d || '');
+            if (systemDrive && l.indexOf(systemDrive) === 0) return;
+            if (l.length >= 2 && l.charAt(1) === ':') {
+                refreshDriveMask();
+                if (!letterExists(l.charAt(0))) { r.replace(1); return; }
+                r.replace(3); blocked('GetDriveTypeW', this._d || '');
+            }
+        });
+        hook('kernel32.dll', 'GetDriveTypeA', function (a) { this._d = as(a[0]); }, function (r) {
+            var l = normPath(this._d || '');
+            if (systemDrive && l.indexOf(systemDrive) === 0) return;
+            if (l.length >= 2 && l.charAt(1) === ':') {
+                refreshDriveMask();
+                if (!letterExists(l.charAt(0))) { r.replace(1); return; }
+                r.replace(3); blocked('GetDriveTypeA', this._d || '');
+            }
+        });
+        ['SetupDiGetClassDevsW', 'SetupDiGetClassDevsA', 'SetupDiGetClassDevsExW', 'SetupDiGetClassDevsExA'].forEach(function (n) {
+            var isW = n.endsWith('W') || n.endsWith('ExW');
+            hook('setupapi.dll', n, function (a) {
+                try { this._d = isW ? ws(a[0]) : as(a[0]); } catch (e) {}
+            }, function (r) {
+                if (!r.isNull()) { r.replace(ptr(-1)); setErr(18); blocked(n, this._d || ''); }
+            });
+        });
+    }
+
+    if (C.registry) {
+        [['advapi32.dll', 'RegOpenKeyExW', true, 4], ['advapi32.dll', 'RegOpenKeyExA', false, 4],
+         ['advapi32.dll', 'RegOpenKeyW', true, 2], ['advapi32.dll', 'RegOpenKeyA', false, 2],
+         ['advapi32.dll', 'RegCreateKeyExW', true, 7],
+         ['advapi32.dll', 'RegCreateKeyExA', false, 7]].forEach(function (t) {
+            hook(t[0], t[1], function (a) {
+                var k = null; try { k = t[2] ? ws(a[1]) : as(a[1]); } catch (e) {}
+                var rootPath = lookupRegPath(a[0]) || 'root';
+                var full = rootPath + '\\' + (k || '');
+                this._b = shouldBlockReg(full, null); this._d = k;
+                this._fullPath = full;
+                try { this._ph = a[t[3]]; } catch (e2) { this._ph = null; }
+            }, function (r) {
+                if (!this._b) return;
+                try {
+                    if (r.toInt32() === 0) {
+                        try {
+                            var ph = this._ph;
+                            if (ph && !ph.isNull()) {
+                                var h = ph.readPointer();
+                                if (h && !h.isNull()) regClose(h);
+                                ph.writePointer(ptr(0));
+                            }
+                        } catch (e) {}
+                        r.replace(5); setErr(5);
+                    }
+                } catch (e) {}
+                blocked('RegOpen', this._d || '');
+            });
+        });
+        [['advapi32.dll', 'RegQueryValueExW', true], ['advapi32.dll', 'RegQueryValueExA', false]].forEach(function (t) {
+            hook(t[0], t[1], function (a) {
+                var v = null; try { v = t[2] ? ws(a[1]) : as(a[1]); } catch (e) {}
+                var parent = lookupRegPath(a[0]);
+                this._b = shouldBlockReg(parent, v); this._d = v;
+                this._pData = a[4]; this._pLen = a[5];
+            }, function (r) {
+                if (!this._b) return;
+                try {
+                    if (r.toInt32() === 0 && !this._pData.isNull() && !this._pLen.isNull()) {
+                        var n = this._pLen.readU32();
+                        if (n) zeroMem(this._pData, n, n);
+                        this._pLen.writeU32(0);
+                    }
+                    r.replace(5); setErr(5);
+                } catch (e) { try { r.replace(5); } catch (e2) {} }
+                blocked('RegQuery', this._d || '');
+            });
+        });
+    }
+
+    ['CreateProcessW', 'CreateProcessA'].forEach(function (n) {
+        var isW = n.endsWith('W');
+        hook('kernel32.dll', n, function (a) {
+            var app = null, cmd = null;
+            try { app = isW ? ws(a[0]) : as(a[0]); } catch (e) {}
+            try { cmd = isW ? ws(a[1]) : as(a[1]); } catch (e) {}
+            var la = low(((app || '') + ' ' + (cmd || '')));
+            var appBase = app ? basenameOf(low(app.split('/').join('\\'))) : '';
+            this._b = false;
+            for (var i = 0; i < C.procBlockSubstr.length; i++) {
+                if (la.indexOf(C.procBlockSubstr[i]) >= 0) { this._b = true; break; }
+            }
+            if (!this._b) {
+                for (var j = 0; j < C.procBlockExeAndArg.length; j++) {
+                    var pair = C.procBlockExeAndArg[j];
+                    if (appBase === pair[0] && la.indexOf(pair[1]) >= 0) { this._b = true; break; }
+                }
+            }
+            if (this._b) blocked(n, 'detect-cmdline :: ' + la);
+        }, function (r) {
+            if (this._b && r.toInt32() !== 0) { r.replace(0); setErr(2); }
+        });
+    });
+
+    try {
+        var NtQIP = Module.getExportByName('ntdll.dll', 'NtQueryInformationProcess');
+        var ProcessCommandLineInformation = 60;
+        Interceptor.attach(NtQIP, {
+            onEnter: function (a) {
+                try {
+                    var cls = a[1].toInt32();
+                    this._b = (cls === ProcessCommandLineInformation);
+                    this._out = a[2];
+                    this._outLen = a[3];
+                    this._pRet = a[4];
+                } catch (e) { this._b = false; }
+            },
+            onLeave: function (r) {
+                if (!this._b) return;
+                try {
+                    if (this._outLen && !this._outLen.isNull()) {
+                        var n = this._outLen.readU32();
+                        if (n > 0) zeroMem(this._out, n, n);
+                        this._outLen.writeU32(0);
+                    }
+                    if (this._pRet && !this._pRet.isNull()) this._pRet.writeU32(0);
+                } catch (e) {}
+                r.replace(0);
+                blocked('NtQueryInformationProcess', 'ProcessCommandLineInformation');
+            }
+        });
+        log("[GUARD] ntdll.dll!NtQueryInformationProcess");
+    } catch (e) { log("[MISS] ntdll.dll!NtQueryInformationProcess"); }
+
+    log("Privacy guard installed. eventlog=" + C.eventlog + " prefetch=" + C.prefetch +
+        " datausage=" + C.datausage + " registry=" + C.registry + " strictReg=" + C.strictReg +
+        " autorun=" + C.autorun + " history=" + C.history + " elevated=" + C.elevated +
+        " dnsdps=" + C.dnsdps + " usn=" + C.usn + " usb=" + C.usb + " browser=" + C.browser +
+        " tasksCom=" + C.tasksCom + " wmi=" + C.wmi);
+})();
+'''
+
+def _js_bool(v):
+    return "true" if v else "false"
+
+def build_js():
+    repl = {
+        "%EVENTLOG%":  _js_bool(BLOCK_EVENTLOG),
+        "%PREFETCH%":  _js_bool(BLOCK_PREFETCH),
+        "%DATAUSAGE%": _js_bool(BLOCK_DATAUSAGE),
+        "%REGISTRY%":  _js_bool(BLOCK_REGISTRY),
+        "%STRICTREG%": _js_bool(STRICT_REGISTRY),
+        "%AUTORUN%":   _js_bool(BLOCK_AUTORUN),
+        "%HISTORY%":   _js_bool(BLOCK_HISTORY),
+        "%ELEVATED%%": _js_bool(BLOCK_ELEVATED_LOGS),
+        "%ELEVATED%":  _js_bool(BLOCK_ELEVATED_LOGS),
+        "%DNSDPS%":    _js_bool(BLOCK_DNSCACHE_DPS),
+        "%USN%":       _js_bool(BLOCK_SECURITY_USN),
+        "%USB%":       _js_bool(BLOCK_USB),
+        "%BROWSER%":   _js_bool(BLOCK_BROWSER_HISTORY),
+        "%TASKCOM%":   _js_bool(BLOCK_TASKS_COM),
+        "%WMI%":       _js_bool(BLOCK_WMI),
+        "%REGBLOCK%":  json.dumps([s.lower() for s in REG_BLOCK]),
+        "%REGALLOW%":  json.dumps([s.lower() for s in REG_ALLOW]),
+        "%VALUEBLOCK%": json.dumps([s.lower() for s in VALUE_BLOCK_NAMES]),
+        "%HIDEEXTS%":  json.dumps([s.lower() for s in HIDE_EXTS]),
+        "%EXTALLOW%":  json.dumps([s.lower() for s in EXT_ALLOW]),
+        "%WV2ALLOW%":  json.dumps([s.lower() for s in WEBVIEW2_ALLOW]),
+        "%HIDDENNAMES%": json.dumps([s.lower() for s in HIDDEN_NAMES]),
+        "%HIDDENTASKNAMES%": json.dumps([s.lower() for s in HIDDEN_TASK_NAMES]),
+        "%SENSITIVEDIRS%": json.dumps([s.lower() for s in SENSITIVE_DIRS]),
+        "%PROCBLOCKSUBSTR%": json.dumps([s.lower() for s in PROC_BLOCK_SUBSTR]),
+        "%PROCBLOCKEXEARG%": json.dumps([[a.lower(), b.lower()] for (a, b) in PROC_BLOCK_EXE_AND_ARG]),
+    }
+    js = JS
+    for k, v in repl.items():
+        js = js.replace(k, v)
+    return js
+
+def on_msg(m, d):
+    if m["type"] != "send":
+        if m["type"] == "error":
+            log_line(f"[!] Frida: {m.get('description', m)}")
+        return
+    p = m["payload"]
+    t = p.get("type")
+    ts = time.strftime("%H:%M:%S")
+    if t == "info":
+        log_line(f"[*] {p['message']}")
+    elif t == "error":
+        log_line(f"[!] {p['message']}")
+    elif t == "blocked":
+        log_line(f"[{ts}] [BLOCKED] {p.get('api')}  {p.get('detail')}")
+    else:
+        log_line(f"[?] {json.dumps(p)}")
+
+def find_existing(substr):
+    out = []
+    for p in psutil.process_iter(["pid", "name", "status"]):
+        try:
+            if substr not in (p.info["name"] or "").lower():
+                continue
+            if p.info["status"] in (psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD):
+                continue
+            out.append(p.info)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    return out
+
+# =====================================================================
+# CONSOLE HELPERS
+# =====================================================================
+def _enable_vt():
+    try:
+        kernel32 = ctypes.windll.kernel32
+        h = kernel32.GetStdHandle(-11)
+        mode = ctypes.c_uint32()
+        if kernel32.GetConsoleMode(h, ctypes.byref(mode)):
+            kernel32.SetConsoleMode(h, mode.value | 0x0004)
+    except Exception:
+        pass
+
+def green(s):
+    return f"\033[92m{s}\033[0m"
+
+def hide_console():
+    """Hide the console window entirely (so the script runs in background)."""
+    try:
+        kernel32 = ctypes.windll.kernel32
+        user32 = ctypes.windll.user32
+        hwnd = kernel32.GetConsoleWindow()
+        if hwnd:
+            user32.ShowWindow(hwnd, 0)  # SW_HIDE
+    except Exception:
+        pass
+
+# =====================================================================
+# MAIN
+# =====================================================================
+def main():
+    _enable_vt()
+
+    # First: find the target process. Keep console visible while doing so.
+    log_line(f'[*] Waiting for process with "{SUBSTR}" in exe name...')
+    first = None
+    while not first:
+        matches = find_existing(SUBSTR)
+        if matches:
+            first = matches[0]
+            break
+        time.sleep(1)
+
+    pid = first["pid"]
+    log_line(f'[*] Attaching to PID {pid} ...')
+
+    # Attach + load guard. Any exception here = error, print in red and exit.
+    try:
+        session = frida.attach(pid)
+        script = session.create_script(build_js())
+        script.on("message", on_msg)
+        script.load()
+    except Exception as e:
+        print(f"\033[91mError: {e}\033[0m")
+        sys.exit(1)
+
+    # Success path
+    log_line("[*] Guard active.")
+    _VERBOSE = False
+    print()
+    print(green("Works"))
+    print("Press Enter to continue (run in background)...")
+    try:
+        input()
+    except EOFError:
+        pass
+
+    # Hide console and keep running in background
+    hide_console()
+
+    attached = {pid}
+    attach_failures = {}
+    while True:
+        try:
+            time.sleep(2)
+            for mm in find_existing(SUBSTR):
+                np = mm["pid"]
+                if np in attached:
+                    continue
+                last = attach_failures.get(np, 0)
+                if time.time() - last < 30:
+                    continue
+                attach_failures[np] = time.time()
+                try:
+                    s2 = frida.attach(np)
+                    sc2 = s2.create_script(build_js())
+                    sc2.on("message", on_msg)
+                    sc2.load()
+                    attached.add(np)
+                    attach_failures.pop(np, None)
+                except Exception:
+                    pass
+        except KeyboardInterrupt:
+            break
+        except Exception:
+            pass
+
+    try:
+        script.unload()
+    except Exception:
+        pass
+    try:
+        session.detach()
+    except Exception:
+        pass
+
+if __name__ == "__main__":
+    main()
