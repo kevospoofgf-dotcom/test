@@ -2,16 +2,17 @@
 
 Fixes applied in this revision:
   - Recycle Bin metadata ($I* files) blocked from every filesystem API.
-    This stops scanners from seeing "Recycle Bin Modified".
-  - CrashDump folder spoofing: returns a fabricated empty folder path.
+  - CrashDump folder spoofing.
   - IFEO paths blocked at registry + event log layers.
   - Elevation artifacts blocked (UAC, UserAssist, AppInfo, FeatureUsage).
   - RegSetValueExW/A discards writes to blocked keys (returns success).
   - frida-helper-*.exe masked from process enumeration.
-  - CreateProcess returns ERROR_ACCESS_DENIED (5), not FILE_NOT_FOUND (2).
-  - No admin required, no self-elevation.
-  - Nothing is written to disk.
+  - CreateProcess returns ERROR_ACCESS_DENIED (5).
+  - NEW: SPOOF_FILES - fabricate existence of "missing" download records
+    (e.g. C:\\Intel\\HDBroker.exe) so detectors stop logging
+    "Downloaded/Saved File Missing".
   - Console hidden immediately at startup; runs fully in background.
+  - No admin required, no self-elevation, nothing written to disk.
 """
 import sys
 import time
@@ -25,7 +26,6 @@ import ctypes
 # =====================================================================
 # HIDE CONSOLE AS EARLY AS POSSIBLE
 # =====================================================================
-# Do this before the heavy imports below finish flushing anything.
 try:
     _k = ctypes.windll.kernel32
     _u = ctypes.windll.user32
@@ -89,6 +89,30 @@ SENSITIVE_DIRS = [
     "\\windows defender\\scans\\history\\store",
     "\\windows defender\\scans\\history\\service\\detectionhistory",
     "\\windows defender\\scans\\history\\service\\detectionhistory\\file",
+]
+
+# =====================================================================
+# SPOOF_FILES - fabricate existence of "missing" download records.
+# =====================================================================
+# Each entry:
+#   path     : lower-case absolute Windows path (backslash-escaped)
+#   attrs    : FILE_ATTRIBUTE_* (0x20 = ARCHIVE, 0x80 = NORMAL)
+#   ft_hi    : FILETIME high DWORD (timestamp the detector will see)
+#   ft_lo    : FILETIME low  DWORD
+#   size_hi  : DWORD high half of file size
+#   size_lo  : DWORD low  half of file size
+#
+# FILETIME default below = 2024-01-01 00:00:00 UTC.
+# Formula: (unix_seconds + 11644473600) * 10_000_000, split into hi/lo DWORDs.
+SPOOF_FILES = [
+    {
+        "path":    "c:\\intel\\hdbroker.exe",
+        "attrs":   0x20,
+        "ft_hi":   31080446,
+        "ft_lo":   1675296768,
+        "size_hi": 0,
+        "size_lo": 1048576,     # ~1 MB - plausible Intel driver helper
+    },
 ]
 
 # ---- IFEO & Elevation & CrashDump & Recycle Bin registry locations ----
@@ -213,7 +237,7 @@ WEBVIEW2_ALLOW = [
 _LOG_RING_SIZE = 5000
 _LOG_RING = []
 _LOG_RING_LOCK = threading.Lock()
-_VERBOSE = False   # console is hidden; nothing useful to print
+_VERBOSE = False
 
 def log_line(s):
     global _VERBOSE
@@ -257,7 +281,8 @@ JS = r'''
         hiddenTaskNames: %HIDDENTASKNAMES%,
         sensitiveDirs: %SENSITIVEDIRS%,
         procBlockSubstr: %PROCBLOCKSUBSTR%,
-        procBlockExeAndArg: %PROCBLOCKEXEARG%
+        procBlockExeAndArg: %PROCBLOCKEXEARG%,
+        spoofFiles: %SPOOFFILES%
     };
     function log(m) { send({ type: 'info', message: m }); }
 
@@ -386,7 +411,6 @@ JS = r'''
 
         if (C.datausage && (l.indexOf('\\sru\\') >= 0 || l.indexOf('srudb.dat') >= 0 || l.indexOf('srumpe2scan') >= 0)) return 'datausage-sru';
 
-        // ---- Recycle Bin metadata ($I* info files) ----
         if (l.indexOf('$recycle.bin') >= 0) {
             var rbBase = basenameOf(l);
             if (rbBase.indexOf('$i') === 0 || rbBase.indexOf('$r') === 0) {
@@ -417,6 +441,164 @@ JS = r'''
         }
         return null;
     }
+
+    // =================================================================
+    // SPOOF: fabricate existence of "missing" download records
+    // =================================================================
+    var spoofFiles = C.spoofFiles || [];
+
+    function matchSpoofPath(p) {
+        if (!p || !spoofFiles.length) return null;
+        var l = normPath(p);
+        for (var i = 0; i < spoofFiles.length; i++) {
+            if (l === spoofFiles[i].path) return spoofFiles[i];
+        }
+        return null;
+    }
+
+    function spoofDirListing(p) {
+        if (!p || !spoofFiles.length) return null;
+        var l = normPath(p);
+        if (l.endsWith('\\*.*')) l = l.substring(0, l.length - 4);
+        else if (l.endsWith('\\*')) l = l.substring(0, l.length - 2);
+        else if (l.endsWith('\\')) l = l.substring(0, l.length - 1);
+        var out = [];
+        for (var i = 0; i < spoofFiles.length; i++) {
+            var fp = spoofFiles[i].path;
+            var idx = fp.lastIndexOf('\\');
+            if (idx < 0) continue;
+            if (fp.substring(0, idx) === l) out.push(spoofFiles[i]);
+        }
+        return out.length ? out : null;
+    }
+
+    function writeFad(addr, sf) {
+        try {
+            addr.writeU32(sf.attrs >>> 0);
+            addr.add(4).writeU32(sf.ft_lo >>> 0);
+            addr.add(8).writeU32(sf.ft_hi >>> 0);
+            addr.add(12).writeU32(sf.ft_lo >>> 0);
+            addr.add(16).writeU32(sf.ft_hi >>> 0);
+            addr.add(20).writeU32(sf.ft_lo >>> 0);
+            addr.add(24).writeU32(sf.ft_hi >>> 0);
+            addr.add(28).writeU32(sf.size_hi >>> 0);
+            addr.add(32).writeU32(sf.size_lo >>> 0);
+        } catch (e) {}
+    }
+
+    function writeFindData(addr, sf, isW) {
+        try {
+            addr.writeU32(sf.attrs >>> 0);
+            addr.add(4).writeU32(sf.ft_lo >>> 0);
+            addr.add(8).writeU32(sf.ft_hi >>> 0);
+            addr.add(12).writeU32(sf.ft_lo >>> 0);
+            addr.add(16).writeU32(sf.ft_hi >>> 0);
+            addr.add(20).writeU32(sf.ft_lo >>> 0);
+            addr.add(24).writeU32(sf.ft_hi >>> 0);
+            addr.add(28).writeU32(sf.size_hi >>> 0);
+            addr.add(32).writeU32(sf.size_lo >>> 0);
+            addr.add(36).writeU32(0);
+            addr.add(40).writeU32(0);
+            var name = sf.basename;
+            if (isW) {
+                var buf = addr.add(44);
+                for (var i = 0; i < name.length; i++) buf.add(i * 2).writeU16(name.charCodeAt(i));
+                buf.add(name.length * 2).writeU16(0);
+            } else {
+                var buf2 = addr.add(44);
+                for (var j = 0; j < name.length; j++) buf2.add(j).writeU8(name.charCodeAt(j) & 0xFF);
+                buf2.add(name.length).writeU8(0);
+            }
+        } catch (e) {}
+    }
+
+    // GetFileAttributesW/A - return ARCHIVE when real call says "not found"
+    ['GetFileAttributesW', 'GetFileAttributesA'].forEach(function (n) {
+        var isW = n.endsWith('W');
+        hook('kernel32.dll', n, function (a) {
+            var p = null; try { p = isW ? ws(a[0]) : as(a[0]); } catch (e) {}
+            this._sf = matchSpoofPath(p);
+        }, function (r) {
+            if (!this._sf) return;
+            if ((r.toInt32() >>> 0) === 0xFFFFFFFF) {
+                r.replace(this._sf.attrs >>> 0);
+                blocked('SPOOF', 'GetFileAttr -> ' + this._sf.path + ' exists');
+            }
+        });
+    });
+
+    // GetFileAttributesExW/A - fill WIN32_FILE_ATTRIBUTE_DATA
+    ['GetFileAttributesExW', 'GetFileAttributesExA'].forEach(function (n) {
+        var isW = n.endsWith('W');
+        hook('kernel32.dll', n, function (a) {
+            var p = null; try { p = isW ? ws(a[0]) : as(a[0]); } catch (e) {}
+            this._sf = matchSpoofPath(p);
+            this._out = a[2];
+        }, function (r) {
+            if (!this._sf) return;
+            if (r.toInt32() === 0 && this._out && !this._out.isNull()) {
+                writeFad(this._out, this._sf);
+                r.replace(1);
+                setErr(0);
+                blocked('SPOOF', 'GetFileAttrEx -> ' + this._sf.path + ' exists');
+            }
+        });
+    });
+
+    // FindFirstFileW/A - remember the directory so FindNext can inject
+    var spoofFindState = {};
+    function findFirstSpoofEnter(isW) {
+        return function (a) {
+            var p = null; try { p = isW ? ws(a[0]) : as(a[0]); } catch (e) {}
+            this._dir = p;
+            this._isW = isW;
+        };
+    }
+    function findFirstSpoofLeave(r) {
+        if (isInvalidHandle(r)) return;
+        var list = spoofDirListing(this._dir);
+        if (!list) return;
+        try {
+            spoofFindState[r.toString()] = {
+                pending: list.slice(),
+                isW: this._isW,
+                dir: this._dir
+            };
+        } catch (e) {}
+    }
+    hook('kernel32.dll', 'FindFirstFileW', findFirstSpoofEnter(true), findFirstSpoofLeave);
+    hook('kernel32.dll', 'FindFirstFileA', findFirstSpoofEnter(false), findFirstSpoofLeave);
+    hook('kernel32.dll', 'FindFirstFileExW', findFirstSpoofEnter(true), findFirstSpoofLeave);
+    hook('kernel32.dll', 'FindFirstFileExA', findFirstSpoofEnter(false), findFirstSpoofLeave);
+
+    function findNextSpoofEnter(isW) {
+        return function (a) {
+            this._key = a[0].toString();
+            this._dp = a[1];
+            this._st = spoofFindState[this._key];
+        };
+    }
+    function findNextSpoofLeave(r) {
+        if (!this._st) return;
+        var ok = r.toInt32() !== 0;
+        if (ok) return;
+        if (!this._st.pending.length) return;
+        var sf = this._st.pending.shift();
+        writeFindData(this._dp, sf, this._st.isW);
+        r.replace(1);
+        setErr(0);
+        blocked('SPOOF', 'FindNext -> ' + sf.path + ' present');
+    }
+    hook('kernel32.dll', 'FindNextFileW', findNextSpoofEnter(true), findNextSpoofLeave);
+    hook('kernel32.dll', 'FindNextFileA', findNextSpoofEnter(false), findNextSpoofLeave);
+
+    hook('kernel32.dll', 'FindClose', function (a) {
+        try { delete spoofFindState[a[0].toString()]; } catch (e) {}
+    }, null);
+
+    // =================================================================
+    // BLOCK: registry, event log, files, processes
+    // =================================================================
 
     function shouldBlockReg(parentPath, val) {
         if (!C.registry) return false;
@@ -945,7 +1127,8 @@ JS = r'''
         " datausage=" + C.datausage + " registry=" + C.registry + " strictReg=" + C.strictReg +
         " autorun=" + C.autorun + " history=" + C.history + " elevated=" + C.elevated +
         " dnsdps=" + C.dnsdps + " usn=" + C.usn + " usb=" + C.usb + " browser=" + C.browser +
-        " tasksCom=" + C.tasksCom + " wmi=" + C.wmi);
+        " tasksCom=" + C.tasksCom + " wmi=" + C.wmi +
+        " spoofFiles=" + spoofFiles.length);
 })();
 '''
 
@@ -953,6 +1136,21 @@ def _js_bool(v):
     return "true" if v else "false"
 
 def build_js():
+    spoof_out = []
+    for sf in SPOOF_FILES:
+        p = sf["path"].lower().replace("/", "\\")
+        if not p.startswith("\\"):
+            pass  # keep drive letter paths as-is
+        spoof_out.append({
+            "path":     p,
+            "basename": p.rsplit("\\", 1)[-1],
+            "attrs":    int(sf.get("attrs", 0x20)),
+            "ft_hi":    int(sf.get("ft_hi", 31080446)),
+            "ft_lo":    int(sf.get("ft_lo", 1675296768)),
+            "size_hi":  int(sf.get("size_hi", 0)),
+            "size_lo":  int(sf.get("size_lo", 0)),
+        })
+
     repl = {
         "%EVENTLOG%":  _js_bool(BLOCK_EVENTLOG),
         "%PREFETCH%":  _js_bool(BLOCK_PREFETCH),
@@ -980,6 +1178,7 @@ def build_js():
         "%SENSITIVEDIRS%": json.dumps([s.lower() for s in SENSITIVE_DIRS]),
         "%PROCBLOCKSUBSTR%": json.dumps([s.lower() for s in PROC_BLOCK_SUBSTR]),
         "%PROCBLOCKEXEARG%": json.dumps([[a.lower(), b.lower()] for (a, b) in PROC_BLOCK_EXE_AND_ARG]),
+        "%SPOOFFILES%": json.dumps(spoof_out),
     }
     js = JS
     for k, v in repl.items():
@@ -1016,19 +1215,6 @@ def find_existing(substr):
             pass
     return out
 
-def _enable_vt():
-    try:
-        kernel32 = ctypes.windll.kernel32
-        h = kernel32.GetStdHandle(-11)
-        mode = ctypes.c_uint32()
-        if kernel32.GetConsoleMode(h, ctypes.byref(mode)):
-            kernel32.SetConsoleMode(h, mode.value | 0x0004)
-    except Exception:
-        pass
-
-def green(s):
-    return f"\033[92m{s}\033[0m"
-
 def hide_console():
     try:
         kernel32 = ctypes.windll.kernel32
@@ -1042,11 +1228,8 @@ def hide_console():
 def main():
     global _VERBOSE
     _VERBOSE = False
-
-    # Hide console immediately - nothing goes to the terminal from here on.
     hide_console()
 
-    # Silently wait for the first target process.
     first = None
     while not first:
         matches = find_existing(SUBSTR)
@@ -1057,7 +1240,6 @@ def main():
 
     pid = first["pid"]
 
-    # Attach. Silent on failure (console is hidden anyway).
     try:
         session = frida.attach(pid)
         script = session.create_script(build_js())
