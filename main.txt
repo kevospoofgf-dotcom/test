@@ -11,8 +11,8 @@ Fixes applied in this revision:
   - CreateProcess returns ERROR_ACCESS_DENIED (5), not FILE_NOT_FOUND (2).
   - No admin required, no self-elevation.
   - Nothing is written to disk.
+  - Console hidden immediately at startup; runs fully in background.
 """
-import frida
 import sys
 import time
 import os
@@ -21,6 +21,21 @@ import threading
 import queue
 import psutil
 import ctypes
+
+# =====================================================================
+# HIDE CONSOLE AS EARLY AS POSSIBLE
+# =====================================================================
+# Do this before the heavy imports below finish flushing anything.
+try:
+    _k = ctypes.windll.kernel32
+    _u = ctypes.windll.user32
+    _h = _k.GetConsoleWindow()
+    if _h:
+        _u.ShowWindow(_h, 0)
+except Exception:
+    pass
+
+import frida
 
 # =====================================================================
 # CONFIG
@@ -198,7 +213,7 @@ WEBVIEW2_ALLOW = [
 _LOG_RING_SIZE = 5000
 _LOG_RING = []
 _LOG_RING_LOCK = threading.Lock()
-_VERBOSE = True
+_VERBOSE = False   # console is hidden; nothing useful to print
 
 def log_line(s):
     global _VERBOSE
@@ -371,10 +386,7 @@ JS = r'''
 
         if (C.datausage && (l.indexOf('\\sru\\') >= 0 || l.indexOf('srudb.dat') >= 0 || l.indexOf('srumpe2scan') >= 0)) return 'datausage-sru';
 
-        // ---- NEW: Recycle Bin metadata ($I* info files) ----
-        // Every deletion writes a $I<id> file (and $R<id>) under $Recycle.Bin.
-        // Forensics tools read $I files to reconstruct deletion history.
-        // Blocking them makes the bin look untouched.
+        // ---- Recycle Bin metadata ($I* info files) ----
         if (l.indexOf('$recycle.bin') >= 0) {
             var rbBase = basenameOf(l);
             if (rbBase.indexOf('$i') === 0 || rbBase.indexOf('$r') === 0) {
@@ -560,7 +572,6 @@ JS = r'''
         if (isHiddenTaskName(ctx)) return true;
         if (ctx.indexOf('\\prefetch\\') >= 0) return true;
         if (ctx.indexOf('\\winevt\\') >= 0 && l.endsWith('.evtx')) return true;
-        // ---- NEW: hide $I / $R entries when enumerating $Recycle.Bin ----
         if (ctx.indexOf('$recycle.bin') >= 0) {
             if (l.indexOf('$i') === 0 || l.indexOf('$r') === 0) return true;
         }
@@ -1030,9 +1041,12 @@ def hide_console():
 
 def main():
     global _VERBOSE
-    _enable_vt()
+    _VERBOSE = False
 
-    log_line(f'[*] Waiting for process with "{SUBSTR}" in exe name...')
+    # Hide console immediately - nothing goes to the terminal from here on.
+    hide_console()
+
+    # Silently wait for the first target process.
     first = None
     while not first:
         matches = find_existing(SUBSTR)
@@ -1042,33 +1056,21 @@ def main():
         time.sleep(1)
 
     pid = first["pid"]
-    log_line(f'[*] Attaching to PID {pid} ...')
 
+    # Attach. Silent on failure (console is hidden anyway).
     try:
         session = frida.attach(pid)
         script = session.create_script(build_js())
         script.on("message", on_msg)
         script.load()
-    except Exception as e:
-        print(f"\033[91mError: {e}\033[0m")
+    except Exception:
         sys.exit(1)
-
-    log_line("[*] Guard active.")
-    _VERBOSE = False
-    print()
-    print(green("Works"))
-    print("Press Enter to continue (run in background)...")
-    try:
-        input()
-    except EOFError:
-        pass
-
-    hide_console()
 
     attached = {pid}
     attach_failures = {}
-    while True:
-        try:
+
+    try:
+        while True:
             time.sleep(2)
             for mm in find_existing(SUBSTR):
                 np = mm["pid"]
@@ -1087,10 +1089,10 @@ def main():
                     attach_failures.pop(np, None)
                 except Exception:
                     pass
-        except KeyboardInterrupt:
-            break
-        except Exception:
-            pass
+    except KeyboardInterrupt:
+        pass
+    except Exception:
+        pass
 
     try:
         script.unload()
