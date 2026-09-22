@@ -11,8 +11,8 @@ Fixes applied in this revision:
   - CreateProcess returns ERROR_ACCESS_DENIED (5), not FILE_NOT_FOUND (2).
   - No admin required, no self-elevation.
   - Nothing is written to disk.
-  - Fully silent: console window hidden immediately, no stdout output,
-    never waits on input.
+  - Fully silent: console window is HIDDEN (WS_EX_TOOLWINDOW + SWP_HIDEWINDOW
+    + FreeConsole) instead of merely minimized, and no stdout is emitted.
 """
 import frida
 import sys
@@ -191,17 +191,16 @@ WEBVIEW2_ALLOW = [
 _LOG_RING_SIZE = 5000
 _LOG_RING = []
 _LOG_RING_LOCK = threading.Lock()
-_VERBOSE = False  # hardcoded off
+_VERBOSE = False
 
 def log_line(s):
-    # Never writes to stdout; keeps an in-memory ring for diagnostics.
     with _LOG_RING_LOCK:
         _LOG_RING.append(s)
         if len(_LOG_RING) > _LOG_RING_SIZE:
             del _LOG_RING[0:len(_LOG_RING) - _LOG_RING_SIZE]
 
 # =====================================================================
-# FRIDA JS (unchanged)
+# FRIDA JS (unchanged from previous revision)
 # =====================================================================
 JS = r'''
 (function () {
@@ -988,32 +987,80 @@ def find_existing(substr):
             pass
     return out
 
+# =====================================================================
+# HIDE CONSOLE (flag-based; not just minimize)
+# =====================================================================
+
+# GetWindowLongPtr constants
+GWL_EXSTYLE      = -20
+WS_EX_TOOLWINDOW = 0x00000080   # never appear on the taskbar / Alt-Tab
+WS_EX_NOACTIVATE = 0x08000000   # never take focus when shown
+WS_EX_APPWINDOW  = 0x00040000   # forces a taskbar button — must be cleared
+
+SW_HIDE          = 0
+SWP_HIDEWINDOW   = 0x0080
+SWP_NOACTIVATE   = 0x0010
+SWP_NOMOVE       = 0x0002
+SWP_NOSIZE       = 0x0001
+SWP_NOZORDER     = 0x0004
+
 def hide_console():
-    """Hide the owning console window (works when launched from cmd/PowerShell)."""
+    """Hide the console window with real Win32 flags, not just minimize.
+
+    Order matters:
+      1. Grab the HWND from GetConsoleWindow() while we're still attached.
+      2. Set extended window styles so the window can never be taskbar'd or
+         re-activated (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, clear WS_EX_APPWINDOW).
+      3. ShowWindow(SW_HIDE) *and* SetWindowPos(SWP_HIDEWINDOW) — the second
+         call defeats cmd.exe/conhost's tendency to re-show after SW_HIDE.
+      4. FreeConsole() so the process is fully detached and nothing (cmd.exe,
+         conhost.exe, a stray traceback) can ever write to or re-open it.
+    """
     try:
         kernel32 = ctypes.windll.kernel32
-        user32 = ctypes.windll.user32
+        user32   = ctypes.windll.user32
+
+        # Make sure our function prototypes are wide/pointer-correct.
+        user32.GetWindowLongW.restype  = ctypes.c_long
+        user32.GetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        user32.SetWindowLongW.restype  = ctypes.c_long
+        user32.SetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_long]
+        user32.ShowWindow.argtypes     = [ctypes.c_void_p, ctypes.c_int]
+        user32.SetWindowPos.argtypes   = [ctypes.c_void_p, ctypes.c_void_p,
+                                          ctypes.c_int, ctypes.c_int,
+                                          ctypes.c_int, ctypes.c_int,
+                                          ctypes.c_uint]
+        kernel32.GetConsoleWindow.restype  = ctypes.c_void_p
+
         hwnd = kernel32.GetConsoleWindow()
         if hwnd:
-            user32.ShowWindow(hwnd, 0)  # SW_HIDE
-    except Exception:
-        pass
+            # --- 1) extended window style flags ---
+            ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            ex = (ex | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE) & ~WS_EX_APPWINDOW
+            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex)
 
-def detach_from_console():
-    """Detach from the parent console so no further output is possible."""
-    try:
-        kernel32 = ctypes.windll.kernel32
+            # --- 2) hide via both APIs ---
+            user32.ShowWindow(hwnd, SW_HIDE)
+            user32.SetWindowPos(
+                hwnd, None, 0, 0, 0, 0,
+                SWP_HIDEWINDOW | SWP_NOACTIVATE |
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER,
+            )
+
+        # --- 3) detach from the console entirely ---
         kernel32.FreeConsole()
     except Exception:
         pass
 
-def main():
-    # 1) Hide the console window first, before we do anything else.
-    hide_console()
-    # 2) Detach from the console so even stray writes go nowhere.
-    detach_from_console()
+# =====================================================================
+# MAIN
+# =====================================================================
 
-    # Everything from here on runs silently in the background.
+def main():
+    # Hide the console first, before any output or Frida work.
+    hide_console()
+
+    # From here on the process has no console. Everything is silent.
 
     first = None
     while not first:
@@ -1034,7 +1081,6 @@ def main():
         # No console output on failure either — exit quietly.
         sys.exit(1)
 
-    # No input() prompt, no banner — keep running as a background guard.
     attached = {pid}
     attach_failures = {}
     while True:
