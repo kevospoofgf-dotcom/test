@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Frida script to find processes with 'detect' in name and monitor network traffic.
+Frida script to find processes matching 'detect-fm-<PIN>' and monitor network traffic.
 Prints network events and attempts to decrypt common encryption schemes.
+Compatible with Frida 17.x on Windows / Linux / macOS.
 """
 
 import frida
@@ -10,20 +11,19 @@ import json
 import time
 import re
 import base64
-from datetime import datetime
 
 try:
-    from Crypto.Cipher import AES, DES, ARC4
+    from Crypto.Cipher import AES, ARC4
     from Crypto.Util.Padding import unpad
     HAVE_PYCRYPTO = True
 except ImportError:
     HAVE_PYCRYPTO = False
-    print("[!] pycryptodome not installed - AES/DES/RC4 decryption disabled")
-    print("    Install with: pip install pycryptodome")
+    print("[!] pycryptodome not installed - AES/RC4 decryption disabled")
+    print("    Install with: python -m pip install pycryptodome")
 
 
 # ---------------------------------------------------------------------------
-# Frida agent - hooks network APIs across platforms
+# Frida agent - hooks network APIs across platforms (Frida 17 compatible)
 # ---------------------------------------------------------------------------
 JS_AGENT = r"""
 'use strict';
@@ -35,11 +35,7 @@ function ts() {
 }
 
 function emit(payload) {
-    try {
-        send(payload);
-    } catch (e) {
-        console.log('[!] send failed: ' + e);
-    }
+    try { send(payload); } catch (e) { console.log('[!] send failed: ' + e); }
 }
 
 function bytesToHex(bytes) {
@@ -54,9 +50,7 @@ function readMemory(ptr, len) {
     try {
         if (!ptr || ptr.isNull() || len <= 0 || len > 0x100000) return null;
         return new Uint8Array(ptr.readByteArray(len));
-    } catch (e) {
-        return null;
-    }
+    } catch (e) { return null; }
 }
 
 function u8ToStr(u8) {
@@ -72,55 +66,72 @@ function u8ToStr(u8) {
 }
 
 function emitEvent(kind, data) {
-    emit({
-        type: 'network_event',
-        kind: kind,
-        timestamp: ts(),
-        data: data
-    });
+    emit({ type: 'network_event', kind: kind, timestamp: ts(), data: data });
+}
+
+// Frida 17 dropped findExportByName in favor of getExportByName / getGlobalExportByName.
+// This wrapper works on both old and new versions.
+function findExport(moduleName, symbol) {
+    try {
+        if (typeof Module.getExportByName === 'function') {
+            return moduleName
+                ? Module.getExportByName(moduleName, symbol)
+                : Module.getGlobalExportByName(symbol);
+        }
+    } catch (e) {}
+    try {
+        if (typeof Module.findExportByName === 'function') {
+            return Module.findExportByName(moduleName, symbol);
+        }
+    } catch (e) {}
+    try {
+        if (typeof Module.findGlobalExportByName === 'function') {
+            return Module.findGlobalExportByName(symbol);
+        }
+    } catch (e) {}
+    return null;
+}
+
+function getModuleSafe(name) {
+    try { return Process.getModuleByName(name); } catch (e) { return null; }
 }
 
 // -----------------------------------------------------------------
-// Hook libc send/recv/sendto/recvfrom
+// libc / ws2_32 hooks
 // -----------------------------------------------------------------
 function hookLibc() {
-    let libcName = null;
+    let libcName;
     if (Process.platform === 'windows') libcName = 'ws2_32.dll';
     else if (Process.platform === 'darwin') libcName = 'libsystem_c.dylib';
     else libcName = 'libc.so.6';
 
-    let libc = null;
-    try { libc = Process.getModuleByName(libcName); } catch (e) {}
+    let libc = getModuleSafe(libcName);
+    if (!libc && Process.platform === 'linux') libc = getModuleSafe('libc.so');
     if (!libc) {
-        try { libc = Process.getModuleByName('libc.so'); } catch (e) {}
-    }
-    if (!libc) {
-        console.log('[!] could not find libc-like module');
+        console.log('[!] could not find libc-like module (' + libcName + ')');
         return;
     }
 
     const funcs = Process.platform === 'windows'
-        ? [['send', 'int'], ['recv', 'int'], ['sendto', 'int'], ['recvfrom', 'int'], ['WSASend', 'int'], ['WSARecv', 'int']]
-        : [['send', 'ssize_t'], ['recv', 'ssize_t'], ['sendto', 'ssize_t'], ['recvfrom', 'ssize_t'],
-           ['write', 'ssize_t'], ['read', 'ssize_t']];
+        ? ['send', 'recv', 'sendto', 'recvfrom', 'WSASend', 'WSARecv']
+        : ['send', 'recv', 'sendto', 'recvfrom', 'write', 'read'];
 
-    for (const [name, ret] of funcs) {
-        let addr = null;
-        try { addr = Module.findExportByName(libcName, name); } catch (e) {}
-        if (!addr) {
-            try { addr = Module.findExportByName(null, name); } catch (e) {}
-        }
+    for (const name of funcs) {
+        let addr = findExport(libcName, name);
+        if (!addr) addr = findExport(null, name);
         if (!addr) continue;
 
+        const isSend = (name === 'send' || name === 'sendto'
+                        || name === 'write' || name === 'WSASend');
+
         try {
-            if (name === 'send' || name === 'sendto' || name === 'write' || name === 'WSASend') {
+            if (isSend) {
                 Interceptor.attach(addr, {
                     onEnter(args) {
                         const fd = args[0].toInt32();
-                        const buf = args[1];
-                        let len = args[2].toInt32();
-                        // WSASend: buf is WSABUF* structure
+
                         if (name === 'WSASend') {
+                            // args[1] = LPWSABUF, args[2] = dwBufferCount
                             try {
                                 const wsabuf = args[1];
                                 const realLen = wsabuf.readU32();
@@ -128,35 +139,30 @@ function hookLibc() {
                                 const data = readMemory(realBuf, realLen);
                                 if (data) {
                                     emitEvent('outgoing', {
-                                        api: name,
-                                        fd: fd,
-                                        length: realLen,
-                                        hex: bytesToHex(data),
-                                        ascii: u8ToStr(data)
+                                        api: name, fd: fd, length: realLen,
+                                        hex: bytesToHex(data), ascii: u8ToStr(data)
                                     });
                                 }
                             } catch (e) {}
                             return;
                         }
+
+                        const buf = args[1];
+                        const len = args[2].toInt32();
                         if (len <= 0 || len > 0x100000) return;
                         const data = readMemory(buf, len);
                         if (!data) return;
                         emitEvent('outgoing', {
-                            api: name,
-                            fd: fd,
-                            length: len,
-                            hex: bytesToHex(data),
-                            ascii: u8ToStr(data)
+                            api: name, fd: fd, length: len,
+                            hex: bytesToHex(data), ascii: u8ToStr(data)
                         });
                     }
                 });
             } else {
-                // recv/read/recvfrom/WSARecv
                 Interceptor.attach(addr, {
                     onEnter(args) {
                         this.fd = args[0].toInt32();
                         this.buf = args[1];
-                        this.len = args[2].toInt32();
                         this.api = name;
                     },
                     onLeave(retval) {
@@ -175,15 +181,13 @@ function hookLibc() {
                         }
                         if (!data) return;
                         emitEvent('incoming', {
-                            api: this.api,
-                            fd: this.fd,
-                            length: n,
-                            hex: bytesToHex(data),
-                            ascii: u8ToStr(data)
+                            api: this.api, fd: this.fd, length: n,
+                            hex: bytesToHex(data), ascii: u8ToStr(data)
                         });
                     }
                 });
             }
+            console.log('[*] hooked ' + libcName + '!' + name);
         } catch (e) {
             console.log('[!] failed to hook ' + name + ': ' + e);
         }
@@ -191,7 +195,7 @@ function hookLibc() {
 }
 
 // -----------------------------------------------------------------
-// Hook OpenSSL SSL_write / SSL_read (search all modules)
+// OpenSSL / NSS / TLS
 // -----------------------------------------------------------------
 function hookOpenSSL() {
     const symbols = ['SSL_write', 'SSL_read', 'SSL_write_ex', 'SSL_read_ex'];
@@ -200,13 +204,13 @@ function hookOpenSSL() {
 
     for (const m of modules) {
         const n = m.name.toLowerCase();
-        if (n.includes('ssl') || n.includes('crypto') || n.includes('tls') || n.includes('curl') || n.includes('nspr') || n.includes('nss')) {
-            for (const sym of symbols) {
-                try {
-                    const a = Module.findExportByName(m.name, sym);
-                    if (a) targets.push({ sym: sym, addr: a, module: m.name });
-                } catch (e) {}
-            }
+        if (!(n.includes('ssl') || n.includes('crypto') || n.includes('tls')
+              || n.includes('curl') || n.includes('nspr') || n.includes('nss'))) {
+            continue;
+        }
+        for (const sym of symbols) {
+            const a = findExport(m.name, sym);
+            if (a) targets.push({ sym: sym, addr: a, module: m.name });
         }
     }
 
@@ -215,11 +219,13 @@ function hookOpenSSL() {
         if (seen.has(key)) continue;
         seen.add(key);
 
+        const isWrite = t.sym.indexOf('write') !== -1;
+        const isEx = t.sym.endsWith('_ex');
+
         try {
-            if (t.sym.endsWith('_ex')) {
+            if (isEx) {
                 Interceptor.attach(t.addr, {
                     onEnter(args) {
-                        this.ssl = args[0];
                         this.buf = args[1];
                         this.lenPtr = args[2];
                     },
@@ -230,11 +236,9 @@ function hookOpenSSL() {
                             if (n <= 0 || n > 0x100000) return;
                             const data = readMemory(this.buf, n);
                             if (!data) return;
-                            emitEvent(t.sym.indexOf('write') !== -1 ? 'outgoing_tls' : 'incoming_tls', {
-                                api: key,
-                                length: n,
-                                hex: bytesToHex(data),
-                                ascii: u8ToStr(data)
+                            emitEvent(isWrite ? 'outgoing_tls' : 'incoming_tls', {
+                                api: key, length: n,
+                                hex: bytesToHex(data), ascii: u8ToStr(data)
                             });
                         } catch (e) {}
                     }
@@ -242,21 +246,16 @@ function hookOpenSSL() {
             } else {
                 Interceptor.attach(t.addr, {
                     onEnter(args) {
-                        this.ssl = args[0];
                         this.buf = args[1];
-                        this.len = args[2].toInt32();
-                        this.isWrite = t.sym.indexOf('write') !== -1;
                     },
                     onLeave(retval) {
                         const n = retval.toInt32();
                         if (n <= 0 || n > 0x100000) return;
                         const data = readMemory(this.buf, n);
                         if (!data) return;
-                        emitEvent(this.isWrite ? 'outgoing_tls' : 'incoming_tls', {
-                            api: key,
-                            length: n,
-                            hex: bytesToHex(data),
-                            ascii: u8ToStr(data)
+                        emitEvent(isWrite ? 'outgoing_tls' : 'incoming_tls', {
+                            api: key, length: n,
+                            hex: bytesToHex(data), ascii: u8ToStr(data)
                         });
                     }
                 });
@@ -269,15 +268,13 @@ function hookOpenSSL() {
 }
 
 // -----------------------------------------------------------------
-// Hook Java (Android) OkHttp / HttpURLConnection / SSLSocket
+// Java / Android (OkHttp + OutputStream)
 // -----------------------------------------------------------------
 function hookJava() {
-    if (!Java.available) return;
+    if (typeof Java === 'undefined' || !Java.available) return;
     Java.perform(function () {
         try {
             const ResponseBody = Java.use('okhttp3.ResponseBody');
-
-            // Hook response body bytes
             ResponseBody.bytes.implementation = function () {
                 const b = this.bytes();
                 try {
@@ -289,64 +286,59 @@ function hookJava() {
                 } catch (e) {}
                 return b;
             };
-        } catch (e) {
-            // OkHttp not present
-        }
+            console.log('[*] hooked okhttp3.ResponseBody.bytes');
+        } catch (e) {}
 
-        // Generic Java socket streams
         try {
             const OutputStream = Java.use('java.io.OutputStream');
-
             OutputStream.write.overload('[B').implementation = function (b) {
                 try {
-                    const s = Java.array_to_string ? Java.array_to_string(b) : '';
                     emitEvent('java_out', {
                         api: this.getClass().getName() + '.write',
                         length: b.length,
-                        ascii: s
+                        ascii: Java.array_to_string ? Java.array_to_string(b) : ''
                     });
                 } catch (e) {}
                 return this.write(b);
             };
+            console.log('[*] hooked java.io.OutputStream.write');
         } catch (e) {}
     });
 }
 
 // -----------------------------------------------------------------
-// Windows: WinHTTP / WinINet hooks
+// Windows WinHTTP / WinINet
 // -----------------------------------------------------------------
 function hookWindowsHttp() {
     if (Process.platform !== 'windows') return;
+
     const mods = ['winhttp.dll', 'wininet.dll'];
-    for (const m of mods) {
-        try {
-            const mod = Process.getModuleByName(m);
-        } catch (e) { continue; }
-        const syms = m === 'winhttp.dll'
-            ? ['WinHttpWriteData', 'WinHttpReadData', 'WinHttpSendRequest', 'WinHttpReceiveResponse']
-            : ['InternetWriteFile', 'InternetReadFile', 'HttpSendRequestA', 'HttpSendRequestW'];
+    for (const modName of mods) {
+        if (!getModuleSafe(modName)) continue;
+
+        const syms = modName === 'winhttp.dll'
+            ? ['WinHttpWriteData', 'WinHttpReadData']
+            : ['InternetWriteFile', 'InternetReadFile'];
 
         for (const sym of syms) {
-            const addr = Module.findExportByName(m, sym);
+            const addr = findExport(modName, sym);
             if (!addr) continue;
-            const isWrite = sym.toLowerCase().includes('write') || sym.toLowerCase().includes('send');
+
+            const isWrite = sym.toLowerCase().includes('write');
+
             try {
                 if (isWrite) {
                     Interceptor.attach(addr, {
                         onEnter(args) {
-                            let buf, len;
-                            if (sym === 'WinHttpWriteData') { buf = args[1]; len = args[2].toInt32(); }
-                            else if (sym === 'WinHttpSendRequest') { buf = args[1]; len = args[2].toInt32(); }
-                            else if (sym === 'InternetWriteFile') { buf = args[1]; len = args[2].toInt32(); }
-                            else return;
-                            if (len <= 0) return;
+                            // (HANDLE, LPVOID, DWORD, LPDWORD)
+                            const buf = args[1];
+                            const len = args[2].toInt32();
+                            if (len <= 0 || len > 0x100000) return;
                             const data = readMemory(buf, len);
                             if (!data) return;
                             emitEvent('outgoing_winhttp', {
-                                api: m + '!' + sym,
-                                length: len,
-                                hex: bytesToHex(data),
-                                ascii: u8ToStr(data)
+                                api: modName + '!' + sym, length: len,
+                                hex: bytesToHex(data), ascii: u8ToStr(data)
                             });
                         }
                     });
@@ -359,22 +351,22 @@ function hookWindowsHttp() {
                         },
                         onLeave(retval) {
                             try {
-                                let n = this.lenPtr.readU32();
+                                const n = this.lenPtr.readU32();
                                 if (n <= 0 || n > 0x100000) return;
                                 const data = readMemory(this.buf, n);
                                 if (!data) return;
                                 emitEvent('incoming_winhttp', {
-                                    api: m + '!' + this.api,
-                                    length: n,
-                                    hex: bytesToHex(data),
-                                    ascii: u8ToStr(data)
+                                    api: modName + '!' + this.api, length: n,
+                                    hex: bytesToHex(data), ascii: u8ToStr(data)
                                 });
                             } catch (e) {}
                         }
                     });
                 }
-                console.log('[*] hooked ' + m + '!' + sym);
-            } catch (e) {}
+                console.log('[*] hooked ' + modName + '!' + sym);
+            } catch (e) {
+                console.log('[!] hook failed for ' + modName + '!' + sym + ': ' + e);
+            }
         }
     }
 }
@@ -383,11 +375,12 @@ function hookWindowsHttp() {
 // Entry
 // -----------------------------------------------------------------
 setImmediate(function () {
-    console.log('[*] detect_monitor agent loaded into ' + Process.platform + ' pid ' + Process.id);
-    hookLibc();
-    hookOpenSSL();
-    hookWindowsHttp();
-    hookJava();
+    console.log('[*] detect_monitor loaded into ' + Process.platform
+                + ' pid ' + Process.id + ' (' + Process.arch + ')');
+    try { hookLibc(); } catch (e) { console.log('[!] hookLibc: ' + e); }
+    try { hookOpenSSL(); } catch (e) { console.log('[!] hookOpenSSL: ' + e); }
+    try { hookWindowsHttp(); } catch (e) { console.log('[!] hookWindowsHttp: ' + e); }
+    try { hookJava(); } catch (e) { console.log('[!] hookJava: ' + e); }
     console.log('[*] hooks installed');
 });
 """
@@ -399,8 +392,8 @@ setImmediate(function () {
 HEX_RE = re.compile(r'^[0-9a-fA-F]+$')
 
 
-def looks_like_json(s: str) -> bool:
-    s = s.strip()
+def looks_like_json(s):
+    s = (s or '').strip()
     if not s or s[0] not in '{[':
         return False
     try:
@@ -410,78 +403,64 @@ def looks_like_json(s: str) -> bool:
         return False
 
 
-def is_printable(b: bytes, threshold: float = 0.85) -> bool:
+def is_printable(b, threshold=0.85):
     if not b:
         return False
     printable = sum(1 for c in b if 32 <= c < 127 or c in (9, 10, 13))
     return (printable / len(b)) >= threshold
 
 
-def try_decrypt_blob(data: bytes):
-    """
-    Attempt common decryption schemes against a ciphertext blob.
-    Returns a list of (scheme, plaintext_bytes).
-    """
+def try_decrypt_blob(data):
     results = []
-
     if not HAVE_PYCRYPTO:
         return results
 
-    # Try AES-ECB with common keys
     common_keys = [
         b'0123456789abcdef', b'0123456789ABCDEF',
         b'0000000000000000', b'\x00' * 16,
         b'1234567890123456', b'passwordpassword',
-        b'changeit_change1',
     ]
     iv_zero = b'\x00' * 16
 
     for k in common_keys:
-        # AES ECB
         try:
             c = AES.new(k, AES.MODE_ECB)
-            pt = c.decrypt(data)
-            try:
-                pt_u = unpad(pt, 16)
-            except Exception:
-                pt_u = pt
-            if is_printable(pt_u):
-                results.append(('AES-ECB key=' + k.hex(), pt_u))
-        except Exception:
-            pass
-        # AES CBC zero IV
-        try:
-            c = AES.new(k, AES.MODE_CBC, iv_zero)
-            pt = c.decrypt(data)
-            try:
-                pt_u = unpad(pt, 16)
-            except Exception:
-                pt_u = pt
-            if is_printable(pt_u):
-                results.append(('AES-CBC zeroIV key=' + k.hex(), pt_u))
+            pt = c.decrypt(data[:len(data) - (len(data) % 16)])
+            try: pt = unpad(pt, 16)
+            except Exception: pass
+            if is_printable(pt):
+                results.append(('AES-ECB key=' + k.hex(), pt))
         except Exception:
             pass
 
-    # RC4 with common keys
-    for k in [b'key', b'secret', b'password', b'0123456789abcdef']:
         try:
-            c = ARC4.new(k)
-            pt = c.decrypt(data)
+            c = AES.new(k, AES.MODE_CBC, iv_zero)
+            pt = c.decrypt(data[:len(data) - (len(data) % 16)])
+            try: pt = unpad(pt, 16)
+            except Exception: pass
+            if is_printable(pt):
+                results.append(('AES-CBC zeroIV key=' + k.hex(), pt))
+        except Exception:
+            pass
+
+    for k in [b'key', b'secret', b'password']:
+        try:
+            pt = ARC4.new(k).decrypt(data)
             if is_printable(pt):
                 results.append(('RC4 key=' + k.hex(), pt))
         except Exception:
             pass
 
-    # XOR single-byte brute
+    # Single-byte XOR brute
     for key in range(1, 256):
-        pt = bytes(b ^ key for b in data)
+        pt = bytes(b ^ key for b in data[:512])
         if looks_like_json(pt.decode('utf-8', errors='ignore')):
             results.append(('XOR key=0x%02x' % key, pt))
             break
 
     # Base64 layer
     try:
-        s = data.decode('ascii')
+        s = data.decode('ascii', errors='ignore')
         if re.fullmatch(r'[A-Za-z0-9+/=\s]+', s) and len(s) % 4 == 0:
             dec = base64.b64decode(s)
             if is_printable(dec):
@@ -493,19 +472,16 @@ def try_decrypt_blob(data: bytes):
 
 
 # ---------------------------------------------------------------------------
-# Process discovery  <-- FIXED
+# Process discovery
 # ---------------------------------------------------------------------------
 def get_device():
-    """Acquire the appropriate device (local by default)."""
-    # If you need Android over USB, replace with:
-    #     return frida.get_usb_device(timeout=5)
-    # For a remote frida-server:
-    #     return frida.get_device_manager().add_remote_device("192.168.1.10:27042")
+    # Windows / Linux / macOS local
     return frida.get_local_device()
+    # Android over USB:  return frida.get_usb_device(timeout=5)
 
 
 def find_detect_processes(device=None):
-    """Find processes with 'detect' in the name using a device object."""
+    """Match processes like 'detect-fm-<PIN>' (PIN varies per download)."""
     if device is None:
         device = get_device()
 
@@ -517,9 +493,12 @@ def find_detect_processes(device=None):
         return matches
 
     for proc in procs:
-        name = getattr(proc, 'name', '') or ''
-        if 'detect' in name.lower():
+        name = (getattr(proc, 'name', '') or '').lower()
+        # Frida on Windows strips ".exe" and may truncate >15 chars,
+        # so substring match on "detect-fm" is safest.
+        if 'detect-fm' in name:
             matches.append(proc)
+
     return matches
 
 
@@ -529,22 +508,22 @@ def find_detect_processes(device=None):
 def on_message(message, data):
     if message.get('type') == 'send':
         payload = message.get('payload')
-
         if not isinstance(payload, dict):
             print('[raw] ' + str(payload))
             return
-
         if payload.get('type') == 'network_event':
             handle_network_event(payload)
         else:
             print(json.dumps(payload, indent=2))
     elif message.get('type') == 'error':
         print('[frida error] ' + message.get('description', ''))
-        print(message.get('stack', ''))
+        stack = message.get('stack', '')
+        if stack:
+            print(stack)
 
 
 def handle_network_event(evt):
-    kind = evt.get('kind')
+    kind = evt.get('kind', '?')
     data = evt.get('data', {})
     t = evt.get('timestamp', '')
 
@@ -563,9 +542,8 @@ def handle_network_event(evt):
 
     if looks_like_json(data.get('ascii', '')):
         try:
-            j = json.loads(data.get('ascii', ''))
             print('JSON (plaintext):')
-            print(json.dumps(j, indent=2)[:4000])
+            print(json.dumps(json.loads(data.get('ascii', '')), indent=2)[:4000])
         except Exception:
             pass
 
@@ -589,9 +567,9 @@ def handle_network_event(evt):
                         print('    ' + txt[:2000].replace('\n', '\n    '))
                         if looks_like_json(txt):
                             try:
-                                j = json.loads(txt)
                                 print('    JSON:')
-                                print('    ' + json.dumps(j, indent=2)[:2000].replace('\n', '\n    '))
+                                print('    ' + json.dumps(json.loads(txt), indent=2)
+                                      [:2000].replace('\n', '\n    '))
                             except Exception:
                                 pass
                 else:
@@ -607,7 +585,7 @@ def handle_network_event(evt):
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Attach + monitor
 # ---------------------------------------------------------------------------
 def attach_and_monitor(device, proc, session_holder):
     print(f'\n[+] Attaching to {proc.name} (pid={proc.pid})')
@@ -619,34 +597,42 @@ def attach_and_monitor(device, proc, session_holder):
 
     script = session.create_script(JS_AGENT)
     script.on('message', on_message)
-    script.load()
+    try:
+        script.load()
+    except Exception as e:
+        print(f'[!] script.load failed: {e}')
+        try: session.detach()
+        except Exception: pass
+        return None
 
     session_holder.append((proc, session, script))
     print(f'[+] Instrumented pid={proc.pid}')
     return session
 
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 def main():
     print('[*] Acquiring device...')
     device = get_device()
     print(f'[*] Using device: {device}')
 
-    print('[*] Searching for processes containing "detect"...')
+    print('[*] Searching for processes matching "detect-fm"...')
     matches = find_detect_processes(device)
 
-    if not matches:
-        print('[!] No processes found with "detect" in name.')
-        print('    Will keep watching and attach to new ones as they appear.')
-    else:
+    if matches:
         for p in matches:
             print(f'    - {p.name} (pid={p.pid})')
+    else:
+        print('[!] No matching processes found. Will keep polling.')
 
     sessions = []
     for p in matches:
         attach_and_monitor(device, p, sessions)
 
     if not sessions:
-        print('[*] Polling for new "detect" processes every 2s (Ctrl+C to quit)...')
+        print('[*] Polling every 2s for new "detect-fm" processes (Ctrl+C to quit)...')
         known = set()
         try:
             while True:
@@ -666,14 +652,10 @@ def main():
             pass
 
     for proc, sess, script in sessions:
-        try:
-            script.unload()
-        except Exception:
-            pass
-        try:
-            sess.detach()
-        except Exception:
-            pass
+        try: script.unload()
+        except Exception: pass
+        try: sess.detach()
+        except Exception: pass
 
 
 if __name__ == '__main__':
