@@ -8,14 +8,9 @@ Fixes applied in this revision:
   - RegSetValueExW/A discards writes to blocked keys (returns success).
   - frida-helper-*.exe masked from process enumeration.
   - CreateProcess returns ERROR_ACCESS_DENIED (5).
-  - SPOOF_FILES - fabricate existence of "missing" download records so
-    detectors stop logging "Downloaded/Saved File Missing" /
-    "Crashed File Not Present":
-        C:\\Intel\\HDBroker.exe
-        C:\\Users\\xkev5\\Downloads\\detect-fm-02223145.exe
-        C:\\Users\\xkev5\\systeminformer-4.0.26241.138-release-setup.exe
-        C:\\Users\\xkev5\\Documents\\detect-fm-08894453.exe
-  - %LOCALAPPDATA%\\CrashDumps hidden + blocked from every API.
+  - NEW: SPOOF_FILES - fabricate existence of "missing" download records
+    (e.g. C:\\Intel\\HDBroker.exe) so detectors stop logging
+    "Downloaded/Saved File Missing".
   - Console hidden immediately at startup; runs fully in background.
   - No admin required, no self-elevation, nothing written to disk.
 """
@@ -94,57 +89,29 @@ SENSITIVE_DIRS = [
     "\\windows defender\\scans\\history\\store",
     "\\windows defender\\scans\\history\\service\\detectionhistory",
     "\\windows defender\\scans\\history\\service\\detectionhistory\\file",
-    "\\appdata\\local\\crashdumps",
 ]
 
 # =====================================================================
 # SPOOF_FILES - fabricate existence of "missing" download records.
 # =====================================================================
 # Each entry:
-#   path     : lower-case absolute Windows path (double backslashes)
-#   attrs    : FILE_ATTRIBUTE_* (0x20 = ARCHIVE)
-#   ft_hi    : FILETIME high DWORD  (last write time, UTC)
+#   path     : lower-case absolute Windows path (backslash-escaped)
+#   attrs    : FILE_ATTRIBUTE_* (0x20 = ARCHIVE, 0x80 = NORMAL)
+#   ft_hi    : FILETIME high DWORD (timestamp the detector will see)
 #   ft_lo    : FILETIME low  DWORD
-#   size_hi  : file size high DWORD
-#   size_lo  : file size low  DWORD
+#   size_hi  : DWORD high half of file size
+#   size_lo  : DWORD low  half of file size
 #
-# FILETIME default below = 2026-09-22 17:26:46 UTC (matches log timestamp).
+# FILETIME default below = 2024-01-01 00:00:00 UTC.
+# Formula: (unix_seconds + 11644473600) * 10_000_000, split into hi/lo DWORDs.
 SPOOF_FILES = [
-    # ---- Original entry ----
     {
         "path":    "c:\\intel\\hdbroker.exe",
         "attrs":   0x20,
-        "ft_hi":   31280000,
-        "ft_lo":   3041120000,
+        "ft_hi":   31080446,
+        "ft_lo":   1675296768,
         "size_hi": 0,
-        "size_lo": 1048576,        # ~1 MB Intel driver helper
-    },
-    # ---- Crashed File Not Present ----
-    {
-        "path":    "c:\\users\\xkev5\\downloads\\detect-fm-02223145.exe",
-        "attrs":   0x20,
-        "ft_hi":   31280000,
-        "ft_lo":   3041120000,
-        "size_hi": 0,
-        "size_lo": 131072,         # 128 KB dropper
-    },
-    # ---- Downloaded/Saved File Missing (installer) ----
-    {
-        "path":    "c:\\users\\xkev5\\systeminformer-4.0.26241.138-release-setup.exe",
-        "attrs":   0x20,
-        "ft_hi":   31280000,
-        "ft_lo":   3041120000,
-        "size_hi": 0,
-        "size_lo": 15728640,       # ~15 MB installer
-    },
-    # ---- Downloaded/Saved File Missing (dropper) ----
-    {
-        "path":    "c:\\users\\xkev5\\documents\\detect-fm-08894453.exe",
-        "attrs":   0x20,
-        "ft_hi":   31280000,
-        "ft_lo":   3041120000,
-        "size_hi": 0,
-        "size_lo": 98304,          # 96 KB dropper
+        "size_lo": 1048576,     # ~1 MB - plausible Intel driver helper
     },
 ]
 
@@ -373,36 +340,6 @@ JS = r'''
         return i >= 0 ? l.substring(i + 1) : l;
     }
 
-    // =================================================================
-    // SPOOF: fabricate existence of "missing" download records
-    // =================================================================
-    var spoofFiles = C.spoofFiles || [];
-
-    function matchSpoofPath(p) {
-        if (!p || !spoofFiles.length) return null;
-        var l = normPath(p);
-        for (var i = 0; i < spoofFiles.length; i++) {
-            if (l === spoofFiles[i].path) return spoofFiles[i];
-        }
-        return null;
-    }
-
-    function spoofDirListing(p) {
-        if (!p || !spoofFiles.length) return null;
-        var l = normPath(p);
-        if (l.endsWith('\\*.*')) l = l.substring(0, l.length - 4);
-        else if (l.endsWith('\\*')) l = l.substring(0, l.length - 2);
-        else if (l.endsWith('\\')) l = l.substring(0, l.length - 1);
-        var out = [];
-        for (var i = 0; i < spoofFiles.length; i++) {
-            var fp = spoofFiles[i].path;
-            var idx = fp.lastIndexOf('\\');
-            if (idx < 0) continue;
-            if (fp.substring(0, idx) === l) out.push(spoofFiles[i]);
-        }
-        return out.length ? out : null;
-    }
-
     function isWebView2(s) {
         if (!s) return false;
         var l = low(s).split('/').join('\\');
@@ -454,14 +391,6 @@ JS = r'''
         if (isWebView2(s)) return null;
         var l = normPath(s);
 
-        // ---- SPOOF PATHS TAKE PRECEDENCE OVER EVERY BLOCK RULE ----
-        if (matchSpoofPath(l)) return null;
-
-        // ---- CrashDumps folder: %LOCALAPPDATA%\CrashDumps ----
-        if (l.indexOf('\\appdata\\local\\crashdumps') >= 0) return 'crashdumps';
-        // Also match the folder itself in short form (no trailing path)
-        if (l === '\\appdata\\local\\crashdumps') return 'crashdumps';
-
         if (isHiddenName(l)) return 'hidden-artifact';
         if (isHiddenTaskName(l)) return 'autorun-task';
 
@@ -477,7 +406,9 @@ JS = r'''
             return 'bypass-remnant';
 
         if (C.prefetch && l.indexOf('\\prefetch\\') >= 0) return 'prefetch';
+
         if (C.eventlog && l.indexOf('\\winevt\\') >= 0) return 'eventlog-file';
+
         if (C.datausage && (l.indexOf('\\sru\\') >= 0 || l.indexOf('srudb.dat') >= 0 || l.indexOf('srumpe2scan') >= 0)) return 'datausage-sru';
 
         if (l.indexOf('$recycle.bin') >= 0) {
@@ -509,6 +440,36 @@ JS = r'''
             }
         }
         return null;
+    }
+
+    // =================================================================
+    // SPOOF: fabricate existence of "missing" download records
+    // =================================================================
+    var spoofFiles = C.spoofFiles || [];
+
+    function matchSpoofPath(p) {
+        if (!p || !spoofFiles.length) return null;
+        var l = normPath(p);
+        for (var i = 0; i < spoofFiles.length; i++) {
+            if (l === spoofFiles[i].path) return spoofFiles[i];
+        }
+        return null;
+    }
+
+    function spoofDirListing(p) {
+        if (!p || !spoofFiles.length) return null;
+        var l = normPath(p);
+        if (l.endsWith('\\*.*')) l = l.substring(0, l.length - 4);
+        else if (l.endsWith('\\*')) l = l.substring(0, l.length - 2);
+        else if (l.endsWith('\\')) l = l.substring(0, l.length - 1);
+        var out = [];
+        for (var i = 0; i < spoofFiles.length; i++) {
+            var fp = spoofFiles[i].path;
+            var idx = fp.lastIndexOf('\\');
+            if (idx < 0) continue;
+            if (fp.substring(0, idx) === l) out.push(spoofFiles[i]);
+        }
+        return out.length ? out : null;
     }
 
     function writeFad(addr, sf) {
@@ -551,7 +512,7 @@ JS = r'''
         } catch (e) {}
     }
 
-    // ---- GetFileAttributesW/A spoof ----
+    // GetFileAttributesW/A - return ARCHIVE when real call says "not found"
     ['GetFileAttributesW', 'GetFileAttributesA'].forEach(function (n) {
         var isW = n.endsWith('W');
         hook('kernel32.dll', n, function (a) {
@@ -566,7 +527,7 @@ JS = r'''
         });
     });
 
-    // ---- GetFileAttributesExW/A spoof ----
+    // GetFileAttributesExW/A - fill WIN32_FILE_ATTRIBUTE_DATA
     ['GetFileAttributesExW', 'GetFileAttributesExA'].forEach(function (n) {
         var isW = n.endsWith('W');
         hook('kernel32.dll', n, function (a) {
@@ -584,7 +545,7 @@ JS = r'''
         });
     });
 
-    // ---- FindFirstFileW/A: allow spoof-listed files to enumerate ----
+    // FindFirstFileW/A - remember the directory so FindNext can inject
     var spoofFindState = {};
     function findFirstSpoofEnter(isW) {
         return function (a) {
@@ -796,8 +757,6 @@ JS = r'''
         if (ctx.indexOf('$recycle.bin') >= 0) {
             if (l.indexOf('$i') === 0 || l.indexOf('$r') === 0) return true;
         }
-        // ---- Hide the CrashDumps folder entry when enumerating %LOCALAPPDATA% ----
-        if (l === 'crashdumps' && ctx.indexOf('\\appdata\\local\\') >= 0) return true;
         return false;
     }
 
@@ -1180,12 +1139,14 @@ def build_js():
     spoof_out = []
     for sf in SPOOF_FILES:
         p = sf["path"].lower().replace("/", "\\")
+        if not p.startswith("\\"):
+            pass  # keep drive letter paths as-is
         spoof_out.append({
             "path":     p,
             "basename": p.rsplit("\\", 1)[-1],
             "attrs":    int(sf.get("attrs", 0x20)),
-            "ft_hi":    int(sf.get("ft_hi", 31280000)),
-            "ft_lo":    int(sf.get("ft_lo", 3041120000)),
+            "ft_hi":    int(sf.get("ft_hi", 31080446)),
+            "ft_lo":    int(sf.get("ft_lo", 1675296768)),
             "size_hi":  int(sf.get("size_hi", 0)),
             "size_lo":  int(sf.get("size_lo", 0)),
         })
