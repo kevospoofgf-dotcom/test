@@ -10,7 +10,6 @@ import json
 import time
 import re
 import base64
-import hashlib
 from datetime import datetime
 
 try:
@@ -276,11 +275,7 @@ function hookJava() {
     if (!Java.available) return;
     Java.perform(function () {
         try {
-            const Buffer = Java.use('okio.Buffer');
-            const Okio = Java.use('okio.Okio');
-            const RequestBody = Java.use('okhttp3.RequestBody');
             const ResponseBody = Java.use('okhttp3.ResponseBody');
-            const RealCall = Java.use('okhttp3.internal.connection.RealCall');
 
             // Hook response body bytes
             ResponseBody.bytes.implementation = function () {
@@ -289,8 +284,7 @@ function hookJava() {
                     emitEvent('http_response_java', {
                         api: 'okhttp3.ResponseBody.bytes',
                         length: b.length,
-                        ascii: Java.array_to_string ? Java.array_to_string(b) : null,
-                        base64: send({ __b64: true, v: b })
+                        ascii: Java.array_to_string ? Java.array_to_string(b) : null
                     });
                 } catch (e) {}
                 return b;
@@ -299,17 +293,9 @@ function hookJava() {
             // OkHttp not present
         }
 
-        try {
-            const SSLSocket = Java.use('javax.net.ssl.SSLSocket');
-            const SSLSocketImpl = Java.use('sun.security.ssl.SSLSocketImpl');
-            // Fallback via Conscrypt
-        } catch (e) {}
-
         // Generic Java socket streams
         try {
-            const FileOutputStream = Java.use('java.io.FileOutputStream');
             const OutputStream = Java.use('java.io.OutputStream');
-            const InputStream = Java.use('java.io.InputStream');
 
             OutputStream.write.overload('[B').implementation = function (b) {
                 try {
@@ -424,6 +410,13 @@ def looks_like_json(s: str) -> bool:
         return False
 
 
+def is_printable(b: bytes, threshold: float = 0.85) -> bool:
+    if not b:
+        return False
+    printable = sum(1 for c in b if 32 <= c < 127 or c in (9, 10, 13))
+    return (printable / len(b)) >= threshold
+
+
 def try_decrypt_blob(data: bytes):
     """
     Attempt common decryption schemes against a ciphertext blob.
@@ -499,20 +492,33 @@ def try_decrypt_blob(data: bytes):
     return results
 
 
-def is_printable(b: bytes, threshold: float = 0.85) -> bool:
-    if not b:
-        return False
-    printable = sum(1 for c in b if 32 <= c < 127 or c in (9, 10, 13))
-    return (printable / len(b)) >= threshold
+# ---------------------------------------------------------------------------
+# Process discovery  <-- FIXED
+# ---------------------------------------------------------------------------
+def get_device():
+    """Acquire the appropriate device (local by default)."""
+    # If you need Android over USB, replace with:
+    #     return frida.get_usb_device(timeout=5)
+    # For a remote frida-server:
+    #     return frida.get_device_manager().add_remote_device("192.168.1.10:27042")
+    return frida.get_local_device()
 
 
-# ---------------------------------------------------------------------------
-# Process discovery
-# ---------------------------------------------------------------------------
-def find_detect_processes():
+def find_detect_processes(device=None):
+    """Find processes with 'detect' in the name using a device object."""
+    if device is None:
+        device = get_device()
+
     matches = []
-    for proc in frida.enumerate_processes():
-        if 'detect' in proc.name.lower():
+    try:
+        procs = device.enumerate_processes()
+    except Exception as e:
+        print(f'[!] enumerate_processes failed: {e}')
+        return matches
+
+    for proc in procs:
+        name = getattr(proc, 'name', '') or ''
+        if 'detect' in name.lower():
             matches.append(proc)
     return matches
 
@@ -523,10 +529,6 @@ def find_detect_processes():
 def on_message(message, data):
     if message.get('type') == 'send':
         payload = message.get('payload')
-
-        # Handle Java byte array b64 payloads
-        if isinstance(payload, dict) and payload.get('__b64'):
-            return
 
         if not isinstance(payload, dict):
             print('[raw] ' + str(payload))
@@ -546,7 +548,6 @@ def handle_network_event(evt):
     data = evt.get('data', {})
     t = evt.get('timestamp', '')
 
-    # Build header
     api = data.get('api', '?')
     fd = data.get('fd', '?')
     length = data.get('length', '?')
@@ -557,11 +558,9 @@ def handle_network_event(evt):
     print(f'[{t}] {kind.upper():<18} {api}  fd={fd}  len={length}')
     print('-' * 78)
 
-    # Show ASCII preview
     if ascii_preview:
         print('ASCII: ' + repr(ascii_preview))
 
-    # Try JSON directly from ascii
     if looks_like_json(data.get('ascii', '')):
         try:
             j = json.loads(data.get('ascii', ''))
@@ -570,7 +569,6 @@ def handle_network_event(evt):
         except Exception:
             pass
 
-    # Decryption attempts
     if hex_str and HEX_RE.match(hex_str):
         try:
             raw = bytes.fromhex(hex_str)
@@ -578,7 +576,6 @@ def handle_network_event(evt):
             raw = b''
 
         if raw:
-            # If it's already printable, no need to decrypt
             if not is_printable(raw):
                 print('[*] ciphertext (not printable) - attempting decryption...')
                 results = try_decrypt_blob(raw)
@@ -589,9 +586,7 @@ def handle_network_event(evt):
                             txt = pt.decode('utf-8', errors='replace')
                         except Exception:
                             txt = repr(pt)
-                        # Truncate
                         print('    ' + txt[:2000].replace('\n', '\n    '))
-                        # Highlight JSON
                         if looks_like_json(txt):
                             try:
                                 j = json.loads(txt)
@@ -602,7 +597,6 @@ def handle_network_event(evt):
                 else:
                     print('[*] no decryption succeeded with common schemes')
             else:
-                # Try to extract embedded JSON
                 text = raw.decode('utf-8', errors='replace')
                 if looks_like_json(text):
                     try:
@@ -615,10 +609,10 @@ def handle_network_event(evt):
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-def attach_and_monitor(proc, session_holder):
+def attach_and_monitor(device, proc, session_holder):
     print(f'\n[+] Attaching to {proc.name} (pid={proc.pid})')
     try:
-        session = frida.attach(proc.pid)
+        session = device.attach(proc.pid)
     except Exception as e:
         print(f'[!] attach failed: {e}')
         return None
@@ -633,8 +627,12 @@ def attach_and_monitor(proc, session_holder):
 
 
 def main():
+    print('[*] Acquiring device...')
+    device = get_device()
+    print(f'[*] Using device: {device}')
+
     print('[*] Searching for processes containing "detect"...')
-    matches = find_detect_processes()
+    matches = find_detect_processes(device)
 
     if not matches:
         print('[!] No processes found with "detect" in name.')
@@ -645,25 +643,25 @@ def main():
 
     sessions = []
     for p in matches:
-        attach_and_monitor(p, sessions)
+        attach_and_monitor(device, p, sessions)
 
     if not sessions:
-        # Polling loop for new processes
         print('[*] Polling for new "detect" processes every 2s (Ctrl+C to quit)...')
         known = set()
         try:
             while True:
-                for p in find_detect_processes():
+                for p in find_detect_processes(device):
                     if p.pid not in known:
                         known.add(p.pid)
-                        attach_and_monitor(p, sessions)
+                        attach_and_monitor(device, p, sessions)
                 time.sleep(2)
         except KeyboardInterrupt:
             print('\n[*] Stopping...')
     else:
         print('\n[*] Monitoring. Press Ctrl+C to exit.')
         try:
-            sys.stdin.read()
+            while True:
+                time.sleep(1)
         except KeyboardInterrupt:
             pass
 
