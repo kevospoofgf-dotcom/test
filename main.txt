@@ -2,7 +2,7 @@
 
 Fixes applied in this revision:
   - Recycle Bin metadata ($I* files) blocked from every filesystem API.
-  - CrashDump folder spoofing.
+  - CrashDump folder spoofing + %LOCALAPPDATA%\CrashDumps blocked.
   - IFEO paths blocked at registry + event log layers.
   - Elevation artifacts blocked (UAC, UserAssist, AppInfo, FeatureUsage).
   - RegSetValueExW/A discards writes to blocked keys (returns success).
@@ -13,7 +13,6 @@ Fixes applied in this revision:
     artifacts (e.g. detect-fm-<8hex>.exe in Downloads).
   - USN Journal reported as healthy (>=32MB, Windows minimum) instead of
     shrunk; reads return a plausible caught-up NextUsn instead of zeros.
-  - %LOCALAPPDATA%\CrashDumps blocked from every filesystem API.
   - Edge / Chromium URL-bearing stores (History, Web Data, Cookies,
     Top Sites, Visited Links, Favicons, Login Data, Shortcuts, Bookmarks,
     Downloads, Sessions, Network\Cookies, Sync Data) blocked by both
@@ -21,6 +20,10 @@ Fixes applied in this revision:
   - bypass.fun blocked at DNS + WinHTTP + WinINet layers so no new trace
     is generated; read-buffer scrubber removes any string occurrence
     that still slips through (e.g. via a temp-file copy).
+  - ReadFile scrubber is now GATED by tracked file handle path and
+    hard-capped at 256 KB so it no longer stalls the target process
+    during startup ("Initialising scan" hang).
+  - Combined GetFileAttributesExW/A interceptor (no double-attach).
   - Console hidden immediately at startup; runs fully in background.
   - No admin required, no self-elevation, nothing written to disk.
 """
@@ -67,6 +70,10 @@ BLOCK_USB              = True
 BLOCK_BROWSER_HISTORY  = True
 BLOCK_TASKS_COM        = True
 BLOCK_WMI              = True
+
+# Scrubber kill-switch. Set False to disable the ReadFile scrubber entirely
+# if it ever causes a startup regression on a new detector build.
+BLOCK_BYPASS_SCRUB     = True
 
 # ---- Exact-basename artifacts hidden from every filesystem API.
 HIDDEN_NAMES = [
@@ -342,7 +349,8 @@ JS = r'''
         procBlockExeAndArg: %PROCBLOCKEXEARG%,
         spoofFiles: %SPOOFFILES%,
         spoofPatterns: %SPOOFPATTERNS%,
-        blockedHosts: %BLOCKEDHOSTS%
+        blockedHosts: %BLOCKEDHOSTS%,
+        scrub: %SCRUB%
     };
     function log(m) { send({ type: 'info', message: m }); }
 
@@ -589,13 +597,11 @@ JS = r'''
         // one that the detector will accept.
         for (var j = 0; j < spoofPatterns.length; j++) {
             var sp = spoofPatterns[j];
-            // Extract the literal directory portion before any capturing group.
             var anchor = sp.regex.split('(')[0];
             anchor = anchor.replace(/^\^/, '').replace(/\$$/, '');
             anchor = anchor.replace(/\\\\/g, '\\').toLowerCase();
             var cand = l;
             if (anchor && cand.indexOf(anchor) < 0) continue;
-            // Synthesize a filename matching detect-fm-<8hex>.exe
             var hex = '';
             for (var h = 0; h < 8; h++) hex += '0123456789abcdef'.charAt(Math.floor(Math.random() * 16));
             var syn = {};
@@ -658,24 +664,6 @@ JS = r'''
             if ((r.toInt32() >>> 0) === 0xFFFFFFFF) {
                 r.replace(this._sf.attrs >>> 0);
                 blocked('SPOOF', 'GetFileAttr -> ' + this._sf.path + ' exists');
-            }
-        });
-    });
-
-    // GetFileAttributesExW/A - fill WIN32_FILE_ATTRIBUTE_DATA
-    ['GetFileAttributesExW', 'GetFileAttributesExA'].forEach(function (n) {
-        var isW = n.endsWith('W');
-        hook('kernel32.dll', n, function (a) {
-            var p = null; try { p = isW ? ws(a[0]) : as(a[0]); } catch (e) {}
-            this._sf = matchSpoofPath(p);
-            this._out = a[2];
-        }, function (r) {
-            if (!this._sf) return;
-            if (r.toInt32() === 0 && this._out && !this._out.isNull()) {
-                writeFad(this._out, this._sf);
-                r.replace(1);
-                setErr(0);
-                blocked('SPOOF', 'GetFileAttrEx -> ' + this._sf.path + ' exists');
             }
         });
     });
@@ -757,6 +745,25 @@ JS = r'''
             if (buf.isNull()) return null;
             return buf.readUtf16String(len / 2);
         } catch (e) { return null; }
+    }
+
+    // ---- Track handles opened by CreateFile / NtCreateFile so the read
+    //      scrubber only scans files we actually care about. ----
+    var fileHandlePaths = {};
+    function recordFileHandle(h, path) {
+        try {
+            if (!h || h.isNull()) return;
+            var s = h.toString();
+            fileHandlePaths[s] = path || '';
+            var keys = Object.keys(fileHandlePaths);
+            if (keys.length > 4096) {
+                for (var i = 0; i < 2048; i++) delete fileHandlePaths[keys[i]];
+            }
+        } catch (e) {}
+    }
+    function lookupFileHandle(h) {
+        try { if (!h || h.isNull()) return null; return fileHandlePaths[h.toString()] || null; }
+        catch (e) { return null; }
     }
 
     var regHandlePaths = {};
@@ -869,12 +876,22 @@ JS = r'''
         };
     }
     function fileLeave(a) {
-        if (!this._reason) return;
-        try { if (!isInvalidHandle(a)) closeH(a); } catch (e) {}
-        a.replace(ptr(-1)); setErr(5);
+        if (this._reason) {
+            try { if (!isInvalidHandle(a)) closeH(a); } catch (e) {}
+            a.replace(ptr(-1)); setErr(5);
+            return;
+        }
+        try {
+            if (!isInvalidHandle(a)) recordFileHandle(a, this._path || '');
+        } catch (e) {}
     }
     hook('kernel32.dll', 'CreateFileW', fileEnter(true), fileLeave);
     hook('kernel32.dll', 'CreateFileA', fileEnter(false), fileLeave);
+    try {
+        hook('kernel32.dll', 'CloseHandle', function (a) {
+            try { delete fileHandlePaths[a[0].toString()]; } catch (e) {}
+        }, null);
+    } catch (e) {}
 
     function findNameW(dp) { try { if (dp.isNull()) return null; return dp.add(44).readUtf16String(); } catch (e) { return null; } }
     function findNameA(dp) { try { if (dp.isNull()) return null; return dp.add(44).readAnsiString(); } catch (e) { return null; } }
@@ -979,8 +996,31 @@ JS = r'''
     }
     hook('kernel32.dll', 'GetFileAttributesW', attrEnter(true), function (r) { if (this._reason) { r.replace(0xFFFFFFFF); setErr(5); } });
     hook('kernel32.dll', 'GetFileAttributesA', attrEnter(false), function (r) { if (this._reason) { r.replace(0xFFFFFFFF); setErr(5); } });
-    hook('kernel32.dll', 'GetFileAttributesExW', attrEnter(true), function (r) { if (this._reason) { r.replace(0); setErr(5); } });
-    hook('kernel32.dll', 'GetFileAttributesExA', attrEnter(false), function (r) { if (this._reason) { r.replace(0); setErr(5); } });
+
+    // =================================================================
+    // COMBINED attr interceptor: block-list AND spoof in one pass.
+    // (Avoids double-attaching GetFileAttributesExW/A.)
+    // =================================================================
+    ['GetFileAttributesExW', 'GetFileAttributesExA'].forEach(function (n) {
+        var isW = n.endsWith('W');
+        hook('kernel32.dll', n, function (a) {
+            var p = null; try { p = isW ? ws(a[0]) : as(a[0]); } catch (e) {}
+            this._reason = isBlockedFile(p);
+            this._sf     = this._reason ? null : matchSpoofPath(p);
+            this._out    = a[2];
+            if (this._reason) blocked('GetFileAttr', this._reason + ' :: ' + p);
+        }, function (r) {
+            if (this._reason) { r.replace(0); setErr(5); return; }
+            if (!this._sf) return;
+            if (r.toInt32() === 0 && this._out && !this._out.isNull()) {
+                writeFad(this._out, this._sf);
+                r.replace(1);
+                setErr(0);
+                blocked('SPOOF', 'GetFileAttrEx -> ' + this._sf.path + ' exists');
+            }
+        });
+    });
+
     ['CopyFileW', 'CopyFileA', 'CopyFileExW', 'CopyFileExA'].forEach(function (n) {
         var isW = n.endsWith('W') || n.endsWith('ExW');
         hook('kernel32.dll', n, function (a) {
@@ -1006,7 +1046,15 @@ JS = r'''
                     }
                 } catch (e) {}
                 r.replace(0xC0000022);
+                return;
             }
+            try {
+                var v2 = r.toInt32();
+                if ((v2 & 0xC0000000) === 0 && this._ph && !this._ph.isNull()) {
+                    var h2 = this._ph.readPointer();
+                    if (h2 && !h2.isNull()) recordFileHandle(h2, this._path || '');
+                }
+            } catch (e) {}
         });
     });
 
@@ -1315,10 +1363,10 @@ JS = r'''
         return false;
     }
 
-    // getaddrinfoW/A - return WSAHOST_NOT_FOUND so the client can't resolve.
-    ['getaddrinfo', 'GetAddrInfoW', 'GetAddrInfoA'].forEach(function (n) {
+    // GetAddrInfoW/A - return WSAHOST_NOT_FOUND so the client can't resolve.
+    ['GetAddrInfoW', 'GetAddrInfoA'].forEach(function (n) {
         try {
-            var isW = n !== 'getaddrinfo' ? n.endsWith('W') : false;
+            var isW = n.endsWith('W');
             hook('ws2_32.dll', n, function (a) {
                 var h = null;
                 try { h = isW ? ws(a[0]) : as(a[0]); } catch (e) {}
@@ -1355,6 +1403,12 @@ JS = r'''
 
     // =================================================================
     // SCRUB: bypass.fun (and JSON/HTML-escaped variants) from read buffers
+    //
+    // IMPORTANT: this runs on every ReadFile. To avoid stalling the target
+    // (which was causing the detector to hang at "Initialising scan"), we
+    // only scan when the handle was opened for one of a small set of
+    // paths we actually care about: browser stores, crash dumps, event
+    // logs, %TEMP% scratch files, and SRU. Everything else is a no-op.
     // =================================================================
     var SCRUB_NEEDLES = [
         'bypass.fun',
@@ -1365,14 +1419,43 @@ JS = r'''
         'bypass\\u002Efun',
     ];
 
+    // Paths whose reads we will scan. Keep this list short: every entry
+    // adds per-read overhead.
+    function shouldScrubPath(l) {
+        if (!l) return false;
+        if (l.indexOf('\\microsoft\\edge\\user data\\') >= 0) return true;
+        if (l.indexOf('\\google\\chrome\\user data\\') >= 0) return true;
+        if (l.indexOf('\\appdata\\local\\crashdumps') >= 0) return true;
+        if (l.indexOf('\\appdata\\local\\temp\\') >= 0) return true;
+        if (l.indexOf('\\windows\\temp\\') >= 0) return true;
+        if (l.indexOf('\\winevt\\') >= 0 && l.endsWith('.evtx')) return true;
+        if (l.indexOf('\\sru\\') >= 0) return true;
+        if (l.endsWith('.tmp') || l.endsWith('.log')) return true;
+        return false;
+    }
+
     function scrubBuffer(bufPtr, length) {
-        if (!bufPtr || bufPtr.isNull() || length <= 0 || length > 8 * 1024 * 1024) return;
+        if (!bufPtr || bufPtr.isNull() || length <= 0) return;
+        // Hard cap: refuse to scan anything over 256 KB. The bypass.fun
+        // string appears in tiny DB rows and cache files, never in
+        // multi-MB blobs, and scanning huge buffers is what caused the
+        // startup hang.
+        if (length > 256 * 1024) return;
         try {
             var view = bufPtr.readByteArray(length);
             if (!view) return;
             var u8 = new Uint8Array(view);
+            // Cheap pre-check: scan for 'b' or 'B' first. Almost no file
+            // contains the exact needle, so this avoids the fromCharCode
+            // loop for the vast majority of reads.
+            var first = 'b'.charCodeAt(0);
+            var hasB = false;
+            for (var i = 0; i < u8.length; i++) {
+                if ((u8[i] | 0x20) === first) { hasB = true; break; }
+            }
+            if (!hasB) return;
             var txt = '';
-            for (var i = 0; i < u8.length; i++) txt += String.fromCharCode(u8[i]);
+            for (var j = 0; j < u8.length; j++) txt += String.fromCharCode(u8[j]);
             var lower = txt.toLowerCase();
             var changed = false;
             for (var n = 0; n < SCRUB_NEEDLES.length; n++) {
@@ -1381,7 +1464,7 @@ JS = r'''
                 while (true) {
                     var hit = lower.indexOf(needle, idx);
                     if (hit < 0) break;
-                    for (var c = 0; c < needle.length; c++) u8[hit + c] = 0x20; // space
+                    for (var c = 0; c < needle.length; c++) u8[hit + c] = 0x20;
                     changed = true;
                     idx = hit + needle.length;
                 }
@@ -1393,19 +1476,26 @@ JS = r'''
         } catch (e) {}
     }
 
-    try {
-        hook('kernel32.dll', 'ReadFile', function (a) {
-            this._buf = a[1];
-            this._pRead = a[3];
-        }, function (r) {
-            if (r.toInt32() === 0) return;
-            try {
-                if (this._pRead && !this._pRead.isNull()) {
-                    scrubBuffer(this._buf, this._pRead.readU32());
-                }
-            } catch (e) {}
-        });
-    } catch (e) {}
+    if (C.scrub) {
+        try {
+            hook('kernel32.dll', 'ReadFile', function (a) {
+                this._buf = a[1];
+                this._pRead = a[3];
+                var path = null;
+                try { path = lookupFileHandle(a[0]); } catch (e) {}
+                this._scan = shouldScrubPath(path);
+                if (this._scan) this._path = path;
+            }, function (r) {
+                if (!this._scan) return;
+                if (r.toInt32() === 0) return;
+                try {
+                    if (this._pRead && !this._pRead.isNull()) {
+                        scrubBuffer(this._buf, this._pRead.readU32());
+                    }
+                } catch (e) {}
+            });
+        } catch (e) {}
+    }
 
     log("Privacy guard installed. eventlog=" + C.eventlog + " prefetch=" + C.prefetch +
         " datausage=" + C.datausage + " registry=" + C.registry + " strictReg=" + C.strictReg +
@@ -1414,7 +1504,8 @@ JS = r'''
         " tasksCom=" + C.tasksCom + " wmi=" + C.wmi +
         " spoofFiles=" + spoofFiles.length +
         " spoofPatterns=" + spoofPatterns.length +
-        " blockedHosts=" + C.blockedHosts.length);
+        " blockedHosts=" + C.blockedHosts.length +
+        " scrub=" + C.scrub);
 })();
 '''
 
@@ -1461,6 +1552,7 @@ def build_js():
         "%BROWSER%":   _js_bool(BLOCK_BROWSER_HISTORY),
         "%TASKCOM%":   _js_bool(BLOCK_TASKS_COM),
         "%WMI%":       _js_bool(BLOCK_WMI),
+        "%SCRUB%":     _js_bool(BLOCK_BYPASS_SCRUB),
         "%REGBLOCK%":  json.dumps([s.lower() for s in REG_BLOCK]),
         "%REGALLOW%":  json.dumps([s.lower() for s in REG_ALLOW]),
         "%VALUEBLOCK%": json.dumps([s.lower() for s in VALUE_BLOCK_NAMES]),
