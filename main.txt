@@ -8,18 +8,28 @@ Fixes applied in this revision:
   - RegSetValueExW/A discards writes to blocked keys (returns success).
   - frida-helper-*.exe masked from process enumeration.
   - CreateProcess returns ERROR_ACCESS_DENIED (5).
-  - NEW: SPOOF_FILES - fabricate existence of "missing" download records
-    (e.g. C:\\Intel\\HDBroker.exe) so detectors stop logging
-    "Downloaded/Saved File Missing".
+  - SPOOF_FILES - fabricate existence of "missing" download records.
+  - SPOOF_PATTERNS - regex-based wildcard spoofing for randomly-named
+    artifacts (e.g. detect-fm-<8hex>.exe in Downloads).
+  - USN Journal reported as healthy (>=32MB, Windows minimum) instead of
+    shrunk; reads return a plausible caught-up NextUsn instead of zeros.
+  - %LOCALAPPDATA%\CrashDumps blocked from every filesystem API.
+  - Edge / Chromium URL-bearing stores (History, Web Data, Cookies,
+    Top Sites, Visited Links, Favicons, Login Data, Shortcuts, Bookmarks,
+    Downloads, Sessions, Network\Cookies, Sync Data) blocked by both
+    Win32 and NT paths, and hidden from directory enumeration.
+  - bypass.fun blocked at DNS + WinHTTP + WinINet layers so no new trace
+    is generated; read-buffer scrubber removes any string occurrence
+    that still slips through (e.g. via a temp-file copy).
   - Console hidden immediately at startup; runs fully in background.
   - No admin required, no self-elevation, nothing written to disk.
 """
 import sys
 import time
 import os
+import re
 import json
 import threading
-import queue
 import psutil
 import ctypes
 
@@ -113,6 +123,48 @@ SPOOF_FILES = [
         "size_hi": 0,
         "size_lo": 1048576,     # ~1 MB - plausible Intel driver helper
     },
+    {
+        # Explicitly seed the specific crash artifact from the warning so a
+        # detector that remembers the exact filename sees it as present.
+        "path":    "c:\\users\\xkev5\\downloads\\detect-fm-02223145.exe",
+        "attrs":   0x20,
+        "ft_hi":   31080446,
+        "ft_lo":   1675296768,
+        "size_hi": 0,
+        "size_lo": 65536,       # 64 KB - small crash-dump helper
+    },
+]
+
+# Wildcard-spoofed files: any basename matching the regex will be reported as
+# existing when a detector asks. Used for randomly-named crash artifacts that
+# the detector created and then saw disappear.
+SPOOF_PATTERNS = [
+    {
+        # detect-fm-<8 hex>.exe anywhere under a Downloads folder
+        "regex":   r"(^|\\)downloads\\(detect-fm-[0-9a-f]{8}\.exe)$",
+        "attrs":   0x20,
+        "ft_hi":   31080446,
+        "ft_lo":   1675296768,
+        "size_hi": 0,
+        "size_lo": 65536,
+    },
+    {
+        # detect-fm-<8 hex>.exe at the drive root as well
+        "regex":   r"^[a-z]:\\(detect-fm-[0-9a-f]{8}\.exe)$",
+        "attrs":   0x20,
+        "ft_hi":   31080446,
+        "ft_lo":   1675296768,
+        "size_hi": 0,
+        "size_lo": 65536,
+    },
+]
+
+# Hostnames whose connections we refuse to let through. Blocks new traces
+# from being written in the first place.
+BLOCKED_HOSTS = [
+    "bypass.fun",
+    "www.bypass.fun",
+    "api.bypass.fun",
 ]
 
 # ---- IFEO & Elevation & CrashDump & Recycle Bin registry locations ----
@@ -161,6 +213,8 @@ REG_BLOCK = [
     "minidumpdir",
     "dumpfile",
     "dedicateddumpfile",
+    "\\appdata\\local\\crashdumps",
+    "crashdumps",
 
     # ---- Elevation artifacts ----
     "\\windows\\currentversion\\uac",
@@ -176,6 +230,10 @@ REG_BLOCK = [
     "\\microsoft\\windows\\currentversion\\explorer\\featureusage",
     "featureusage",
     "windows defender\\scans\\history\\service\\detectionhistory\\resource",
+
+    # ---- Edge / Chromium URL-bearing registry trails ----
+    "microsoft\\edge\\user data",
+    "\\edge\\blbeacon",
 ]
 
 VALUE_BLOCK_NAMES = []
@@ -282,7 +340,9 @@ JS = r'''
         sensitiveDirs: %SENSITIVEDIRS%,
         procBlockSubstr: %PROCBLOCKSUBSTR%,
         procBlockExeAndArg: %PROCBLOCKEXEARG%,
-        spoofFiles: %SPOOFFILES%
+        spoofFiles: %SPOOFFILES%,
+        spoofPatterns: %SPOOFPATTERNS%,
+        blockedHosts: %BLOCKEDHOSTS%
     };
     function log(m) { send({ type: 'info', message: m }); }
 
@@ -411,6 +471,43 @@ JS = r'''
 
         if (C.datausage && (l.indexOf('\\sru\\') >= 0 || l.indexOf('srudb.dat') >= 0 || l.indexOf('srumpe2scan') >= 0)) return 'datausage-sru';
 
+        // ---- Per-user CrashDumps folder (%LOCALAPPDATA%\CrashDumps) ----
+        if (l.indexOf('\\appdata\\local\\crashdumps\\') >= 0) return 'crashdumps-user';
+        if (l.indexOf('\\appdata\\local\\crashdumps') >= 0 && l.endsWith('\\crashdumps')) return 'crashdumps-user-dir';
+
+        // ---- Edge / Chromium URL-bearing stores (history, cookies, etc.) ----
+        var EDGE_USERDATA = '\\microsoft\\edge\\user data\\';
+        if (l.indexOf(EDGE_USERDATA) >= 0) {
+            var edgeBase = basenameOf(l);
+            // Block the entire Network subfolder stores that carry URLs.
+            if (l.indexOf(EDGE_USERDATA + 'default\\network\\') >= 0) {
+                var nwBase = basenameOf(l);
+                if (nwBase === 'cookies' || nwBase.indexOf('cookies-') === 0 ||
+                    nwBase === 'network persistent state' ||
+                    nwBase === 'transportsecurity' ||
+                    nwBase === 'trust tokens' ||
+                    nwBase === 'reporting and nel') {
+                    return 'edge-network-store';
+                }
+            }
+            if (edgeBase === 'history' || edgeBase.indexOf('history-') === 0 ||
+                edgeBase === 'web data' || edgeBase.indexOf('web data-') === 0 ||
+                edgeBase === 'top sites' || edgeBase.indexOf('top sites-') === 0 ||
+                edgeBase === 'visited links' ||
+                edgeBase === 'favicons' || edgeBase.indexOf('favicons-') === 0 ||
+                edgeBase === 'login data' || edgeBase.indexOf('login data-') === 0 ||
+                edgeBase === 'shortcuts' || edgeBase.indexOf('shortcuts-') === 0 ||
+                edgeBase === 'bookmarks' || edgeBase === 'bookmarks.bak' ||
+                edgeBase === 'downloads' ||
+                edgeBase === 'sessions' ||
+                edgeBase === 'current session' || edgeBase === 'current tabs' ||
+                edgeBase === 'last session' || edgeBase === 'last tabs') {
+                return 'edge-url-store';
+            }
+            // Also block the Sync Data folder (Edge sync state).
+            if (l.indexOf(EDGE_USERDATA + 'default\\sync data\\') >= 0) return 'edge-sync-store';
+        }
+
         if (l.indexOf('$recycle.bin') >= 0) {
             var rbBase = basenameOf(l);
             if (rbBase.indexOf('$i') === 0 || rbBase.indexOf('$r') === 0) {
@@ -446,18 +543,35 @@ JS = r'''
     // SPOOF: fabricate existence of "missing" download records
     // =================================================================
     var spoofFiles = C.spoofFiles || [];
+    var spoofPatterns = C.spoofPatterns || [];
+    var _spoofRegexes = [];
+    for (var _pi = 0; _pi < spoofPatterns.length; _pi++) {
+        try { _spoofRegexes.push({ re: new RegExp(spoofPatterns[_pi].regex), sf: spoofPatterns[_pi] }); }
+        catch (e) { }
+    }
 
     function matchSpoofPath(p) {
-        if (!p || !spoofFiles.length) return null;
+        if (!p) return null;
         var l = normPath(p);
         for (var i = 0; i < spoofFiles.length; i++) {
             if (l === spoofFiles[i].path) return spoofFiles[i];
+        }
+        for (var j = 0; j < _spoofRegexes.length; j++) {
+            if (_spoofRegexes[j].re.test(l)) {
+                var sf = _spoofRegexes[j].sf;
+                var out = {};
+                for (var k in sf) out[k] = sf[k];
+                out.path = l;
+                var idx = l.lastIndexOf('\\');
+                out.basename = idx >= 0 ? l.substring(idx + 1) : l;
+                return out;
+            }
         }
         return null;
     }
 
     function spoofDirListing(p) {
-        if (!p || !spoofFiles.length) return null;
+        if (!p) return null;
         var l = normPath(p);
         if (l.endsWith('\\*.*')) l = l.substring(0, l.length - 4);
         else if (l.endsWith('\\*')) l = l.substring(0, l.length - 2);
@@ -468,6 +582,27 @@ JS = r'''
             var idx = fp.lastIndexOf('\\');
             if (idx < 0) continue;
             if (fp.substring(0, idx) === l) out.push(spoofFiles[i]);
+        }
+        // For pattern-based spoofs, only fabricate a directory entry when the
+        // directory being listed is exactly the directory the pattern anchors
+        // to. We can't know the random basename, so we synthesize a plausible
+        // one that the detector will accept.
+        for (var j = 0; j < spoofPatterns.length; j++) {
+            var sp = spoofPatterns[j];
+            // Extract the literal directory portion before any capturing group.
+            var anchor = sp.regex.split('(')[0];
+            anchor = anchor.replace(/^\^/, '').replace(/\$$/, '');
+            anchor = anchor.replace(/\\\\/g, '\\').toLowerCase();
+            var cand = l;
+            if (anchor && cand.indexOf(anchor) < 0) continue;
+            // Synthesize a filename matching detect-fm-<8hex>.exe
+            var hex = '';
+            for (var h = 0; h < 8; h++) hex += '0123456789abcdef'.charAt(Math.floor(Math.random() * 16));
+            var syn = {};
+            for (var k in sp) syn[k] = sp[k];
+            syn.basename = 'detect-fm-' + hex + '.exe';
+            syn.path = l + '\\' + syn.basename;
+            out.push(syn);
         }
         return out.length ? out : null;
     }
@@ -757,6 +892,26 @@ JS = r'''
         if (ctx.indexOf('$recycle.bin') >= 0) {
             if (l.indexOf('$i') === 0 || l.indexOf('$r') === 0) return true;
         }
+        // Hide Edge URL-carrying stores from directory listings too.
+        if (ctx.indexOf('\\microsoft\\edge\\user data\\') >= 0) {
+            if (l === 'history' || l.indexOf('history-') === 0 ||
+                l === 'web data' || l.indexOf('web data-') === 0 ||
+                l === 'top sites' || l.indexOf('top sites-') === 0 ||
+                l === 'visited links' ||
+                l === 'favicons' || l.indexOf('favicons-') === 0 ||
+                l === 'login data' || l.indexOf('login data-') === 0 ||
+                l === 'shortcuts' || l.indexOf('shortcuts-') === 0 ||
+                l === 'bookmarks' || l === 'bookmarks.bak' ||
+                l === 'downloads' ||
+                l === 'cookies' || l.indexOf('cookies-') === 0 ||
+                l === 'network persistent state' ||
+                l === 'transportsecurity' ||
+                l === 'current session' || l === 'current tabs' ||
+                l === 'last session' || l === 'last tabs') {
+                return true;
+            }
+        }
+        if (ctx.indexOf('\\appdata\\local\\crashdumps') >= 0) return true;
         return false;
     }
 
@@ -862,44 +1017,69 @@ JS = r'''
     var FSCTL_CREATE_USN_JOURNAL   = 0x000900E7;
     var USN_JOURNAL_DATA_SIZE = 64;
     if (C.usn) {
+        // Windows' documented minimum USN journal size is 32 MB (0x2000000).
+        // Values below that trigger "USN Journal Shrunk Below Windows Minimum".
+        var USN_MIN_MAX_SIZE   = 0x2000000;   // 32 MB
+        var USN_ALLOC_DELTA    = 0x400000;    // 4 MB
+        var USN_JOURNAL_ID     = 0x0123456789abcdef;
+        var USN_FIRST_USN      = 0x10000000;  // non-zero so journal looks alive
+        var USN_NEXT_USN       = 0x10001000;  // a few records worth past FirstUsn
+
         hook('kernel32.dll', 'DeviceIoControl', function (a) {
             var code = 0; try { code = a[1].toInt32() >>> 0; } catch (e) {}
             this._code = code;
-            this._out = a[4];
+            this._in   = a[2];
+            this._inSz = a[3].toInt32();
+            this._out  = a[4];
             this._outSz = a[5].toInt32();
             this._pRet = a[6];
-            this._usnQuery = code === FSCTL_QUERY_USN_JOURNAL;
-            this._usnRead  = (code === FSCTL_READ_USN_JOURNAL ||
-                              code === FSCTL_ENUM_USN_DATA ||
-                              code === FSCTL_READ_FILE_USN_DATA);
+            this._usnQuery  = code === FSCTL_QUERY_USN_JOURNAL;
+            this._usnRead   = (code === FSCTL_READ_USN_JOURNAL ||
+                               code === FSCTL_ENUM_USN_DATA ||
+                               code === FSCTL_READ_FILE_USN_DATA);
             this._usnCreate = code === FSCTL_CREATE_USN_JOURNAL;
         }, function (r) {
             if (this._usnQuery) {
                 try {
-                    if (!this._out.isNull() && this._outSz > 0) {
-                        var n = Math.min(this._outSz, USN_JOURNAL_DATA_SIZE);
-                        if (n > 0) zeroMem(this._out, n, n);
-                        if (n >= 56) {
-                            this._out.add(40).writeU64(0x1000000);
-                            this._out.add(48).writeU64(0x400000);
-                        }
-                        if (this._pRet && !this._pRet.isNull()) this._pRet.writeU32(n);
+                    if (!this._out.isNull() && this._outSz >= USN_JOURNAL_DATA_SIZE) {
+                        var p = this._out;
+                        // USN_JOURNAL_DATA_V0 layout:
+                        //   +0  UsnJournalID       (u64)
+                        //   +8  FirstUsn           (i64)
+                        //   +16 NextUsn            (i64)
+                        //   +24 LowestValidUsn     (i64)
+                        //   +32 MaxUsn             (i64)
+                        //   +40 MaximumSize        (u64)
+                        //   +48 AllocationDelta    (u64)
+                        p.writeU64(USN_JOURNAL_ID);
+                        p.add(8).writeU64(USN_FIRST_USN);
+                        p.add(16).writeU64(USN_NEXT_USN);
+                        p.add(24).writeU64(USN_FIRST_USN);
+                        p.add(32).writeU64(0x7FFFFFFFFFFFFFFF);
+                        p.add(40).writeU64(USN_MIN_MAX_SIZE);
+                        p.add(48).writeU64(USN_ALLOC_DELTA);
+                        if (this._pRet && !this._pRet.isNull())
+                            this._pRet.writeU32(USN_JOURNAL_DATA_SIZE);
                     }
                 } catch (e) {}
                 r.replace(1);
-                blocked('DeviceIoControl', 'USN query -> empty header');
+                blocked('DeviceIoControl', 'USN query -> healthy 32MB journal');
                 return;
             }
             if (this._usnRead) {
                 try {
-                    if (!this._out.isNull() && this._outSz > 0) {
-                        var n2 = Math.min(this._outSz, 8);
-                        if (n2 > 0) zeroMem(this._out, n2, n2);
-                        if (this._pRet && !this._pRet.isNull()) this._pRet.writeU32(n2);
+                    if (!this._out.isNull() && this._outSz >= 8) {
+                        // READ_USN_JOURNAL / ENUM_USN_DATA both begin the
+                        // output buffer with a USN (NextUsn / StartUsn echo).
+                        // Return a plausible NextUsn past the current one so
+                        // the detector believes it's caught up.
+                        this._out.writeU64(USN_NEXT_USN + 0x1000);
+                        if (this._pRet && !this._pRet.isNull())
+                            this._pRet.writeU32(8);
                     }
                 } catch (e) {}
                 r.replace(1);
-                blocked('DeviceIoControl', 'USN read -> 0 records');
+                blocked('DeviceIoControl', 'USN read -> caught up, 0 new records');
                 return;
             }
             if (this._usnCreate) {
@@ -1123,12 +1303,118 @@ JS = r'''
         log("[GUARD] ntdll.dll!NtQueryInformationProcess");
     } catch (e) { log("[MISS] ntdll.dll!NtQueryInformationProcess"); }
 
+    // =================================================================
+    // BLOCK: DNS / connect to bypass.fun
+    // =================================================================
+    function hostBlocked(h) {
+        if (!h) return false;
+        var l = low(h);
+        for (var i = 0; i < C.blockedHosts.length; i++) {
+            if (l === C.blockedHosts[i] || l.endsWith('.' + C.blockedHosts[i])) return true;
+        }
+        return false;
+    }
+
+    // getaddrinfoW/A - return WSAHOST_NOT_FOUND so the client can't resolve.
+    ['getaddrinfo', 'GetAddrInfoW', 'GetAddrInfoA'].forEach(function (n) {
+        try {
+            var isW = n !== 'getaddrinfo' ? n.endsWith('W') : false;
+            hook('ws2_32.dll', n, function (a) {
+                var h = null;
+                try { h = isW ? ws(a[0]) : as(a[0]); } catch (e) {}
+                this._b = hostBlocked(h);
+            }, function (r) {
+                if (this._b) { r.replace(11001); blocked(n, 'bypass.fun DNS'); }
+            });
+        } catch (e) {}
+    });
+
+    // WinHTTP / WinINet URL open - refuse hosts we don't like.
+    try {
+        hook('winhttp.dll', 'WinHttpOpenRequest', function (a) {
+            var host = null, path = null;
+            try { host = ws(a[1]); } catch (e) {}
+            try { path = ws(a[2]); } catch (e) {}
+            var full = low((host || '') + (path || ''));
+            this._b = full.indexOf('bypass.fun') >= 0;
+            if (this._b) blocked('WinHttpOpenRequest', full);
+        }, function (r) {
+            if (this._b && !r.isNull()) { r.replace(ptr(0)); setErr(12007); }
+        });
+    } catch (e) {}
+
+    try {
+        hook('wininet.dll', 'InternetConnectW', function (a) {
+            var host = null;
+            try { host = ws(a[1]); } catch (e) {}
+            this._b = hostBlocked(host);
+        }, function (r) {
+            if (this._b && !r.isNull()) { r.replace(ptr(0)); setErr(12007); }
+        });
+    } catch (e) {}
+
+    // =================================================================
+    // SCRUB: bypass.fun (and JSON/HTML-escaped variants) from read buffers
+    // =================================================================
+    var SCRUB_NEEDLES = [
+        'bypass.fun',
+        'bypass\\.fun',
+        'bypass%2efun',
+        'bypass%2Efun',
+        'bypass\\u002efun',
+        'bypass\\u002Efun',
+    ];
+
+    function scrubBuffer(bufPtr, length) {
+        if (!bufPtr || bufPtr.isNull() || length <= 0 || length > 8 * 1024 * 1024) return;
+        try {
+            var view = bufPtr.readByteArray(length);
+            if (!view) return;
+            var u8 = new Uint8Array(view);
+            var txt = '';
+            for (var i = 0; i < u8.length; i++) txt += String.fromCharCode(u8[i]);
+            var lower = txt.toLowerCase();
+            var changed = false;
+            for (var n = 0; n < SCRUB_NEEDLES.length; n++) {
+                var needle = SCRUB_NEEDLES[n].toLowerCase();
+                var idx = 0;
+                while (true) {
+                    var hit = lower.indexOf(needle, idx);
+                    if (hit < 0) break;
+                    for (var c = 0; c < needle.length; c++) u8[hit + c] = 0x20; // space
+                    changed = true;
+                    idx = hit + needle.length;
+                }
+            }
+            if (changed) {
+                bufPtr.writeByteArray(u8.buffer);
+                blocked('SCRUB', 'bypass.fun removed from read buffer');
+            }
+        } catch (e) {}
+    }
+
+    try {
+        hook('kernel32.dll', 'ReadFile', function (a) {
+            this._buf = a[1];
+            this._pRead = a[3];
+        }, function (r) {
+            if (r.toInt32() === 0) return;
+            try {
+                if (this._pRead && !this._pRead.isNull()) {
+                    scrubBuffer(this._buf, this._pRead.readU32());
+                }
+            } catch (e) {}
+        });
+    } catch (e) {}
+
     log("Privacy guard installed. eventlog=" + C.eventlog + " prefetch=" + C.prefetch +
         " datausage=" + C.datausage + " registry=" + C.registry + " strictReg=" + C.strictReg +
         " autorun=" + C.autorun + " history=" + C.history + " elevated=" + C.elevated +
         " dnsdps=" + C.dnsdps + " usn=" + C.usn + " usb=" + C.usb + " browser=" + C.browser +
         " tasksCom=" + C.tasksCom + " wmi=" + C.wmi +
-        " spoofFiles=" + spoofFiles.length);
+        " spoofFiles=" + spoofFiles.length +
+        " spoofPatterns=" + spoofPatterns.length +
+        " blockedHosts=" + C.blockedHosts.length);
 })();
 '''
 
@@ -1139,8 +1425,6 @@ def build_js():
     spoof_out = []
     for sf in SPOOF_FILES:
         p = sf["path"].lower().replace("/", "\\")
-        if not p.startswith("\\"):
-            pass  # keep drive letter paths as-is
         spoof_out.append({
             "path":     p,
             "basename": p.rsplit("\\", 1)[-1],
@@ -1151,6 +1435,17 @@ def build_js():
             "size_lo":  int(sf.get("size_lo", 0)),
         })
 
+    spoof_pats_out = []
+    for sp in SPOOF_PATTERNS:
+        spoof_pats_out.append({
+            "regex":    sp["regex"],
+            "attrs":    int(sp.get("attrs", 0x20)),
+            "ft_hi":    int(sp.get("ft_hi", 31080446)),
+            "ft_lo":    int(sp.get("ft_lo", 1675296768)),
+            "size_hi":  int(sp.get("size_hi", 0)),
+            "size_lo":  int(sp.get("size_lo", 0)),
+        })
+
     repl = {
         "%EVENTLOG%":  _js_bool(BLOCK_EVENTLOG),
         "%PREFETCH%":  _js_bool(BLOCK_PREFETCH),
@@ -1159,7 +1454,6 @@ def build_js():
         "%STRICTREG%": _js_bool(STRICT_REGISTRY),
         "%AUTORUN%":   _js_bool(BLOCK_AUTORUN),
         "%HISTORY%":   _js_bool(BLOCK_HISTORY),
-        "%ELEVATED%%": _js_bool(BLOCK_ELEVATED_LOGS),
         "%ELEVATED%":  _js_bool(BLOCK_ELEVATED_LOGS),
         "%DNSDPS%":    _js_bool(BLOCK_DNSCACHE_DPS),
         "%USN%":       _js_bool(BLOCK_SECURITY_USN),
@@ -1179,6 +1473,8 @@ def build_js():
         "%PROCBLOCKSUBSTR%": json.dumps([s.lower() for s in PROC_BLOCK_SUBSTR]),
         "%PROCBLOCKEXEARG%": json.dumps([[a.lower(), b.lower()] for (a, b) in PROC_BLOCK_EXE_AND_ARG]),
         "%SPOOFFILES%": json.dumps(spoof_out),
+        "%SPOOFPATTERNS%": json.dumps(spoof_pats_out),
+        "%BLOCKEDHOSTS%": json.dumps([s.lower() for s in BLOCKED_HOSTS]),
     }
     js = JS
     for k, v in repl.items():
