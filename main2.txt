@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Frida script to find processes matching 'detect-fm-<PIN>' and monitor network traffic.
-Prints network events and attempts to decrypt common encryption schemes.
+Frida script to find 'detect-fm-<PIN>' processes and monitor network traffic.
+Hooks Windows Schannel (EncryptMessage/DecryptMessage) to capture PLAINTEXT
+before TLS encryption and after TLS decryption.
 Compatible with Frida 17.x on Windows / Linux / macOS.
 """
 
@@ -23,16 +24,14 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Frida agent - hooks network APIs across platforms (Frida 17 compatible)
+# Frida agent
 # ---------------------------------------------------------------------------
 JS_AGENT = r"""
 'use strict';
 
 const seen = new Set();
 
-function ts() {
-    return new Date().toISOString();
-}
+function ts() { return new Date().toISOString(); }
 
 function emit(payload) {
     try { send(payload); } catch (e) { console.log('[!] send failed: ' + e); }
@@ -69,8 +68,7 @@ function emitEvent(kind, data) {
     emit({ type: 'network_event', kind: kind, timestamp: ts(), data: data });
 }
 
-// Frida 17 dropped findExportByName in favor of getExportByName / getGlobalExportByName.
-// This wrapper works on both old and new versions.
+// Frida 17 removed findExportByName in favor of getExportByName.
 function findExport(moduleName, symbol) {
     try {
         if (typeof Module.getExportByName === 'function') {
@@ -97,7 +95,118 @@ function getModuleSafe(name) {
 }
 
 // -----------------------------------------------------------------
-// libc / ws2_32 hooks
+// Module dump (diagnostic)
+// -----------------------------------------------------------------
+function dumpModules() {
+    const mods = Process.enumerateModules();
+    console.log('=== TLS-RELATED MODULES (' + mods.length + ' total) ===');
+    for (const m of mods) {
+        const n = m.name.toLowerCase();
+        if (n.includes('ssl') || n.includes('tls') || n.includes('crypto')
+            || n.includes('curl') || n.includes('nss') || n.includes('schannel')
+            || n.includes('secur32') || n.includes('sspicli') || n.includes('ncrypt')
+            || n.includes('boring') || n.includes('mbed') || n.includes('wolf')) {
+            console.log('  ' + m.name + ' @ ' + m.base + ' (' + m.size + ' bytes)');
+        }
+    }
+}
+
+// -----------------------------------------------------------------
+// Windows Schannel hooks — plaintext before/after TLS
+// -----------------------------------------------------------------
+function hookSchannel() {
+    if (Process.platform !== 'windows') return;
+
+    const candidates = [
+        { mod: 'secur32.dll', sym: 'EncryptMessage' },
+        { mod: 'secur32.dll', sym: 'DecryptMessage' },
+        { mod: 'schannel.dll', sym: 'EncryptMessage' },
+        { mod: 'schannel.dll', sym: 'DecryptMessage' },
+        { mod: 'sspicli.dll', sym: 'EncryptMessage' },
+        { mod: 'sspicli.dll', sym: 'DecryptMessage' },
+    ];
+
+    const seenAddrs = new Set();
+
+    for (const c of candidates) {
+        const addr = findExport(c.mod, c.sym);
+        if (!addr) continue;
+        const key = addr.toString();
+        if (seenAddrs.has(key)) continue;
+        seenAddrs.add(key);
+
+        const isEncrypt = c.sym.indexOf('Encrypt') !== -1;
+
+        try {
+            if (isEncrypt) {
+                Interceptor.attach(addr, {
+                    onEnter(args) {
+                        // EncryptMessage(PSecHandle, ULONG, PSecBufferDesc, ULONG)
+                        try {
+                            const pBuffers = args[2];
+                            const cBuffers = pBuffers.readU32();
+                            const bufArray = pBuffers.add(Process.pointerSize).readPointer();
+                            for (let i = 0; i < cBuffers; i++) {
+                                const entry = bufArray.add(i * 3 * Process.pointerSize);
+                                const cbBuffer = entry.readU32();
+                                const bufType = entry.add(8).readU32();
+                                const pvBuffer = entry.add(16).readPointer();
+                                // 0x01 = SECBUFFER_DATA
+                                if (bufType !== 0x01) continue;
+                                if (cbBuffer === 0 || cbBuffer > 0x100000) continue;
+                                const data = readMemory(pvBuffer, cbBuffer);
+                                if (!data) continue;
+                                emitEvent('outgoing_schannel_plain', {
+                                    api: c.mod + '!' + c.sym,
+                                    length: cbBuffer,
+                                    hex: bytesToHex(data),
+                                    ascii: u8ToStr(data)
+                                });
+                            }
+                        } catch (e) {}
+                    }
+                });
+            } else {
+                Interceptor.attach(addr, {
+                    onEnter(args) {
+                        this.pBuffers = args[2];
+                    },
+                    onLeave(retval) {
+                        // SEC_E_OK == 0
+                        if (retval.toInt32() !== 0) return;
+                        try {
+                            const pBuffers = this.pBuffers;
+                            const cBuffers = pBuffers.readU32();
+                            const bufArray = pBuffers.add(Process.pointerSize).readPointer();
+                            for (let i = 0; i < cBuffers; i++) {
+                                const entry = bufArray.add(i * 3 * Process.pointerSize);
+                                const cbBuffer = entry.readU32();
+                                const bufType = entry.add(8).readU32();
+                                const pvBuffer = entry.add(16).readPointer();
+                                if (bufType !== 0x01) continue;
+                                if (cbBuffer === 0 || cbBuffer > 0x100000) continue;
+                                const data = readMemory(pvBuffer, cbBuffer);
+                                if (!data) continue;
+                                emitEvent('incoming_schannel_plain', {
+                                    api: c.mod + '!' + c.sym,
+                                    length: cbBuffer,
+                                    hex: bytesToHex(data),
+                                    ascii: u8ToStr(data)
+                                });
+                            }
+                        } catch (e) {}
+                    }
+                });
+            }
+            console.log('[*] hooked ' + c.mod + '!' + c.sym + ' @ ' + addr);
+        } catch (e) {
+            console.log('[!] failed to hook ' + c.mod + '!' + c.sym + ': ' + e);
+        }
+    }
+}
+
+// -----------------------------------------------------------------
+// libc / ws2_32 — fallback socket-level capture
 // -----------------------------------------------------------------
 function hookLibc() {
     let libcName;
@@ -129,9 +238,7 @@ function hookLibc() {
                 Interceptor.attach(addr, {
                     onEnter(args) {
                         const fd = args[0].toInt32();
-
                         if (name === 'WSASend') {
-                            // args[1] = LPWSABUF, args[2] = dwBufferCount
                             try {
                                 const wsabuf = args[1];
                                 const realLen = wsabuf.readU32();
@@ -146,7 +253,6 @@ function hookLibc() {
                             } catch (e) {}
                             return;
                         }
-
                         const buf = args[1];
                         const len = args[2].toInt32();
                         if (len <= 0 || len > 0x100000) return;
@@ -195,17 +301,22 @@ function hookLibc() {
 }
 
 // -----------------------------------------------------------------
-// OpenSSL / NSS / TLS
+// OpenSSL / NSS / TLS (for non-Schannel targets)
 // -----------------------------------------------------------------
 function hookOpenSSL() {
-    const symbols = ['SSL_write', 'SSL_read', 'SSL_write_ex', 'SSL_read_ex'];
+    const symbols = [
+        'SSL_write', 'SSL_read', 'SSL_write_ex', 'SSL_read_ex',
+        'SSL_Write', 'SSL_Read',
+        'EVP_EncryptUpdate', 'EVP_DecryptUpdate'
+    ];
     const modules = Process.enumerateModules();
     const targets = [];
 
     for (const m of modules) {
         const n = m.name.toLowerCase();
         if (!(n.includes('ssl') || n.includes('crypto') || n.includes('tls')
-              || n.includes('curl') || n.includes('nspr') || n.includes('nss'))) {
+              || n.includes('curl') || n.includes('nspr') || n.includes('nss')
+              || n.includes('boring') || n.includes('mbed') || n.includes('wolf'))) {
             continue;
         }
         for (const sym of symbols) {
@@ -219,7 +330,8 @@ function hookOpenSSL() {
         if (seen.has(key)) continue;
         seen.add(key);
 
-        const isWrite = t.sym.indexOf('write') !== -1;
+        const isWrite = t.sym.toLowerCase().indexOf('write') !== -1
+                     || t.sym.toLowerCase().indexOf('encrypt') !== -1;
         const isEx = t.sym.endsWith('_ex');
 
         try {
@@ -261,14 +373,12 @@ function hookOpenSSL() {
                 });
             }
             console.log('[*] hooked ' + key);
-        } catch (e) {
-            console.log('[!] hook failed for ' + key + ': ' + e);
-        }
+        } catch (e) {}
     }
 }
 
 // -----------------------------------------------------------------
-// Java / Android (OkHttp + OutputStream)
+// Java / Android
 // -----------------------------------------------------------------
 function hookJava() {
     if (typeof Java === 'undefined' || !Java.available) return;
@@ -286,7 +396,6 @@ function hookJava() {
                 } catch (e) {}
                 return b;
             };
-            console.log('[*] hooked okhttp3.ResponseBody.bytes');
         } catch (e) {}
 
         try {
@@ -301,7 +410,6 @@ function hookJava() {
                 } catch (e) {}
                 return this.write(b);
             };
-            console.log('[*] hooked java.io.OutputStream.write');
         } catch (e) {}
     });
 }
@@ -330,7 +438,6 @@ function hookWindowsHttp() {
                 if (isWrite) {
                     Interceptor.attach(addr, {
                         onEnter(args) {
-                            // (HANDLE, LPVOID, DWORD, LPDWORD)
                             const buf = args[1];
                             const len = args[2].toInt32();
                             if (len <= 0 || len > 0x100000) return;
@@ -364,9 +471,7 @@ function hookWindowsHttp() {
                     });
                 }
                 console.log('[*] hooked ' + modName + '!' + sym);
-            } catch (e) {
-                console.log('[!] hook failed for ' + modName + '!' + sym + ': ' + e);
-            }
+            } catch (e) {}
         }
     }
 }
@@ -377,6 +482,8 @@ function hookWindowsHttp() {
 setImmediate(function () {
     console.log('[*] detect_monitor loaded into ' + Process.platform
                 + ' pid ' + Process.id + ' (' + Process.arch + ')');
+    try { dumpModules(); } catch (e) { console.log('[!] dumpModules: ' + e); }
+    try { hookSchannel(); } catch (e) { console.log('[!] hookSchannel: ' + e); }
     try { hookLibc(); } catch (e) { console.log('[!] hookLibc: ' + e); }
     try { hookOpenSSL(); } catch (e) { console.log('[!] hookOpenSSL: ' + e); }
     try { hookWindowsHttp(); } catch (e) { console.log('[!] hookWindowsHttp: ' + e); }
@@ -387,9 +494,13 @@ setImmediate(function () {
 
 
 # ---------------------------------------------------------------------------
-# Decryption helpers (Python side)
+# Decryption helpers
 # ---------------------------------------------------------------------------
 HEX_RE = re.compile(r'^[0-9a-fA-F]+$')
+
+# TLS record type + version prefixes we should silently drop
+TLS_PREFIXES = ('160301', '160303', '160302', '140301', '140303',
+                '170301', '170303', '150303', '150301')
 
 
 def looks_like_json(s):
@@ -451,14 +562,12 @@ def try_decrypt_blob(data):
         except Exception:
             pass
 
-    # Single-byte XOR brute
     for key in range(1, 256):
         pt = bytes(b ^ key for b in data[:512])
         if looks_like_json(pt.decode('utf-8', errors='ignore')):
             results.append(('XOR key=0x%02x' % key, pt))
             break
 
-    # Base64 layer
     try:
         s = data.decode('ascii', errors='ignore')
         if re.fullmatch(r'[A-Za-z0-9+/=\s]+', s) and len(s) % 4 == 0:
@@ -475,13 +584,11 @@ def try_decrypt_blob(data):
 # Process discovery
 # ---------------------------------------------------------------------------
 def get_device():
-    # Windows / Linux / macOS local
     return frida.get_local_device()
     # Android over USB:  return frida.get_usb_device(timeout=5)
 
 
 def find_detect_processes(device=None):
-    """Match processes like 'detect-fm-<PIN>' (PIN varies per download)."""
     if device is None:
         device = get_device()
 
@@ -494,11 +601,8 @@ def find_detect_processes(device=None):
 
     for proc in procs:
         name = (getattr(proc, 'name', '') or '').lower()
-        # Frida on Windows strips ".exe" and may truncate >15 chars,
-        # so substring match on "detect-fm" is safest.
         if 'detect-fm' in name:
             matches.append(proc)
-
     return matches
 
 
@@ -523,18 +627,26 @@ def on_message(message, data):
 
 
 def handle_network_event(evt):
-    kind = evt.get('kind', '?')
+    kind = evt.get('kind', '')
     data = evt.get('data', {})
     t = evt.get('timestamp', '')
 
     api = data.get('api', '?')
     fd = data.get('fd', '?')
     length = data.get('length', '?')
-    ascii_preview = (data.get('ascii', '') or '')[:200]
+    ascii_preview = (data.get('ascii', '') or '')[:400]
     hex_str = data.get('hex', '')
 
+    # Filter out raw socket-level TLS framing noise (encrypted records).
+    # We only want Schannel plaintext events and any non-TLS socket traffic.
+    if kind in ('incoming', 'outgoing'):
+        if hex_str[:6] in TLS_PREFIXES:
+            return
+        if length in (1, 9):  # tiny heartbeat/keepalive packets
+            return
+
     print('\n' + '=' * 78)
-    print(f'[{t}] {kind.upper():<18} {api}  fd={fd}  len={length}')
+    print(f'[{t}] {kind.upper():<24} {api}  fd={fd}  len={length}')
     print('-' * 78)
 
     if ascii_preview:
