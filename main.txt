@@ -1,4 +1,4 @@
-"""Block personal-data access via Frida (companion to nefd.py detector).
+r"""Block personal-data access via Frida (companion to nefd.py detector).
 
 Fixes applied in this revision:
   - AutoModeDetect processes excluded from Frida attachment.
