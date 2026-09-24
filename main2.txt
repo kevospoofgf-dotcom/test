@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
 Frida script that finds 'detect-fm-<PIN>' processes and captures decrypted
-network traffic via three layers plus a diagnostic backtrace logger:
-
+network traffic via:
   1. secur32/schannel/sspicli EncryptMessage/DecryptMessage  (sync SSPI)
   2. ws2_32 send/recv/sendto/recvfrom/WSASend/WSARecv        (socket fallback)
   3. ntdll NtDeviceIoControlFile with SSPI IOCTLs            (async SSPI)
-  4. Backtrace logger on EncryptMessage (first 20 calls only)
+  4. Backtrace logger on EncryptMessage (first 20 calls)
+  5. App TLS wrapper probes at frames revealed by the backtrace
 
 Run elevated (Administrator). Frida 17.x compatible.
 """
@@ -87,7 +87,17 @@ function getModuleSafe(name) {
     try { return Process.getModuleByName(name); } catch (e) { return null; }
 }
 
-// Heuristic validator for a PSecBufferDesc
+// Find the main app module (detect-fm-*.exe) and its base
+function getAppModule() {
+    try {
+        const mods = Process.enumerateModules();
+        for (const m of mods) {
+            if (/^detect-fm/i.test(m.name)) return m;
+        }
+    } catch (e) {}
+    return null;
+}
+
 function looksLikeSecBufferDesc(ptr) {
     try {
         if (!ptr || ptr.isNull()) return false;
@@ -111,10 +121,7 @@ function parseSecBufferDesc(pBuffers, api, direction) {
         const bufArray = pBuffers.add(Process.pointerSize).readPointer();
         if (!bufArray || bufArray.isNull()) return;
 
-        // x64 SecBuffer: { ULONG cbBuffer; ULONG BufferType; PVOID pvBuffer; }
-        // with 8-byte alignment → 16 bytes per entry.
         const stride = 16;
-
         for (let i = 0; i < cBuffers; i++) {
             const entry = bufArray.add(i * stride);
             let cbBuffer = 0, bufType = 0, pvBuffer = null;
@@ -124,7 +131,6 @@ function parseSecBufferDesc(pBuffers, api, direction) {
                 pvBuffer = entry.add(8).readPointer();
             } catch (e) { continue; }
 
-            // 0x01 = SECBUFFER_DATA, 0x07 = SECBUFFER_STREAM
             if (bufType !== 0x01 && bufType !== 0x07) continue;
             if (cbBuffer === 0 || cbBuffer > 0x100000) continue;
 
@@ -161,7 +167,7 @@ function hookSchannel() {
     ];
 
     const seenAddrs = new Set();
-    let btBudget = 20;   // print at most 20 backtraces total
+    let btBudget = 20;
 
     for (const c of candidates) {
         const addr = findExport(c.mod, c.sym);
@@ -173,7 +179,6 @@ function hookSchannel() {
         try {
             Interceptor.attach(addr, {
                 onEnter(args) {
-                    // Backtrace logger — only on EncryptMessage
                     if (c.sym === 'EncryptMessage' && btBudget > 0) {
                         btBudget--;
                         try {
@@ -187,15 +192,10 @@ function hookSchannel() {
                                     frames.push('#' + j + ' ' + bt[j]);
                                 }
                             }
-                            emit({
-                                type: 'backtrace',
-                                where: c.mod + '!' + c.sym,
-                                frames: frames
-                            });
-                        } catch (e) {
-                            emit({ type: 'backtrace', where: c.mod + '!' + c.sym,
-                                   frames: ['<backtrace failed: ' + e + '>'] });
-                        }
+                            emit({ type: 'backtrace',
+                                   where: c.mod + '!' + c.sym,
+                                   frames: frames });
+                        } catch (e) {}
                     }
 
                     this.pBuffers = null;
@@ -208,7 +208,6 @@ function hookSchannel() {
                 },
                 onLeave(retval) {
                     if (!this.pBuffers) return;
-                    // SEC_E_OK == 0
                     if (retval.toInt32() !== 0) return;
                     parseSecBufferDesc(this.pBuffers, c.mod + '!' + c.sym, c.dir);
                 }
@@ -300,15 +299,12 @@ function hookLibc() {
 }
 
 // -----------------------------------------------------------------
-// Layer 3: NtDeviceIoControlFile — async SSPI via lsass
+// Layer 3: NtDeviceIoControlFile
 // -----------------------------------------------------------------
 function hookNtIoControl() {
     if (Process.platform !== 'windows') return;
     const addr = findExport('ntdll.dll', 'NtDeviceIoControlFile');
-    if (!addr) {
-        console.log('[!] ntdll!NtDeviceIoControlFile not found');
-        return;
-    }
+    if (!addr) return;
 
     const IOCTL_MAP = {
         0x39000c: 'SSPI_ENCRYPT',
@@ -322,8 +318,7 @@ function hookNtIoControl() {
         Interceptor.attach(addr, {
             onEnter(args) {
                 try {
-                    const raw = args[5];
-                    const ioctl = raw.toInt32() & 0xffffff;
+                    const ioctl = args[5].toInt32() & 0xffffff;
                     const label = IOCTL_MAP[ioctl];
                     if (!label) return;
 
@@ -344,7 +339,6 @@ function hookNtIoControl() {
                             });
                         }
                     }
-
                     if ((label === 'SSPI_DECRYPT' || label === 'SSPI_VERIFY_SIGNATURE')
                         && outBuf && !outBuf.isNull() && outLen > 0 && outLen < 0x100000) {
                         this.outBuf = outBuf;
@@ -375,14 +369,82 @@ function hookNtIoControl() {
 }
 
 // -----------------------------------------------------------------
+// Layer 5: App TLS wrapper probes
+// -----------------------------------------------------------------
+// These are the frames that appeared in every EncryptMessage backtrace.
+// Absolute offsets from the module base.
+const APP_PROBE_OFFSETS = [
+    { off: 0x4650f3, name: 'TLS_frame3'  },
+    { off: 0x4505fe, name: 'TLS_frame4a' },
+    { off: 0x45039b, name: 'TLS_frame4b' },
+    { off: 0x45ce85, name: 'TLS_frame2'  },
+];
+
+// Dump ASCII-looking content of up to 4 pointer args, max once per fn per second
+const probeLastSeen = {};
+
+function hookAppTLS() {
+    if (Process.platform !== 'windows') return;
+
+    const appMod = getAppModule();
+    if (!appMod) {
+        console.log('[!] app module not found — skipping app TLS probes');
+        return;
+    }
+    console.log('[*] app module base: ' + appMod.base + ' (' + appMod.name + ')');
+
+    for (const p of APP_PROBE_OFFSETS) {
+        const target = appMod.base.add(p.off);
+        try {
+            Interceptor.attach(target, {
+                onEnter(args) {
+                    const now = Date.now();
+                    if (probeLastSeen[p.name] && now - probeLastSeen[p.name] < 1000) return;
+                    probeLastSeen[p.name] = now;
+
+                    for (let i = 0; i < 4; i++) {
+                        try {
+                            const a = args[i];
+                            if (!a || a.isNull()) continue;
+                            const data = readMemory(a, 512);
+                            if (!data) continue;
+                            const s = u8ToStr(data);
+                            // Count longest run of printable ASCII
+                            let run = 0, best = 0;
+                            for (let k = 0; k < s.length; k++) {
+                                const c = s.charCodeAt(k);
+                                if (c >= 32 && c < 127) { run++; if (run > best) best = run; }
+                                else run = 0;
+                            }
+                            if (best < 16) continue;
+                            emit({
+                                type: 'probe',
+                                fn: p.name,
+                                arg: i,
+                                ptr: a.toString(),
+                                ascii: s.substring(0, 300)
+                            });
+                        } catch (e) {}
+                    }
+                }
+            });
+            console.log('[*] probe hooked ' + p.name + ' @ ' + target);
+        } catch (e) {
+            console.log('[!] probe ' + p.name + ' failed: ' + e);
+        }
+    }
+}
+
+// -----------------------------------------------------------------
 // Entry
 // -----------------------------------------------------------------
 setImmediate(function () {
-    console.log('[*] AGENT VERSION v4 loaded into ' + Process.platform
+    console.log('[*] AGENT VERSION v5 loaded into ' + Process.platform
                 + ' pid ' + Process.id + ' (' + Process.arch + ')');
     try { hookSchannel();    } catch (e) { console.log('[!] hookSchannel: ' + e); }
     try { hookLibc();        } catch (e) { console.log('[!] hookLibc: ' + e); }
     try { hookNtIoControl(); } catch (e) { console.log('[!] hookNtIoControl: ' + e); }
+    try { hookAppTLS();      } catch (e) { console.log('[!] hookAppTLS: ' + e); }
     console.log('[*] hooks installed');
 });
 """
@@ -447,6 +509,10 @@ def on_message(message, data):
             print('\n[BACKTRACE] ' + payload.get('where', '?'))
             for frame in payload.get('frames', []):
                 print('  ' + frame)
+        elif ptype == 'probe':
+            print(f"\n[PROBE] {payload.get('fn')} arg{payload.get('arg')} "
+                  f"ptr={payload.get('ptr')}")
+            print('  ' + repr(payload.get('ascii', '')))
     elif message.get('type') == 'error':
         print('[frida error] ' + message.get('description', ''))
 
