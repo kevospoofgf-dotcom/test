@@ -1,33 +1,21 @@
 #!/usr/bin/env python3
 """
-Watch for POSTs to /auth/api/scanning/v2/record from detect-fm-<PIN>.exe.
-Hooks sspicli!EncryptMessage (system DLL export — does not touch the app
-module), parses the plaintext buffer, and for every request whose first
-line targets the record endpoint, writes the full request to a file and
-prints a summary.
+Test: intercept POST /auth/api/scanning/v2/record and replace the body with
+an empty JSON payload, so we can observe the server's reaction.
 
-Run elevated. Ctrl+C to exit.
+Run elevated. Attaches to detect-fm-<PIN>.exe.
 """
 
 import frida
 import sys
 import time
-import os
-import tempfile
 import psutil
-
-# Where to write the matched requests
-OUT_DIR = tempfile.gettempdir()
-OUT_FILE = os.path.join(OUT_DIR, 'scanning_records.log')
-
-TARGET_PATH = '/auth/api/scanning/v2/record'
 
 
 JS = r"""
 'use strict';
 
 function emit(p) { try { send(p); } catch (e) {} }
-
 function findExport(mod, sym) {
     try { return Module.getExportByName(mod, sym); } catch (e) {}
     try { return Module.findExportByName(mod, sym); } catch (e) {}
@@ -38,11 +26,10 @@ function getGlobalExport(sym) {
     try { return Module.findExportByName(null, sym); } catch (e) {}
     return null;
 }
-
-function readMem(ptr, len) {
+function readMem(p, n) {
     try {
-        if (!ptr || ptr.isNull() || len <= 0 || len > 0x100000) return null;
-        return new Uint8Array(ptr.readByteArray(len));
+        if (!p || p.isNull() || n <= 0 || n > 0x100000) return null;
+        return new Uint8Array(p.readByteArray(n));
     } catch (e) { return null; }
 }
 function u8ToStr(u8) {
@@ -56,45 +43,16 @@ function u8ToStr(u8) {
 }
 
 var TARGET = '/auth/api/scanning/v2/record';
-var seqCounter = 0;
 
-// Accumulate bytes across multiple EncryptMessage calls belonging to the
-// same logical HTTP request. A single request can be split into multiple
-// buffers by Schannel when the body exceeds the TLS record size.
-var pending = '';           // accumulating plaintext
-var pendingStartTs = 0;     // when the current accumulation began
+// Replacement body we will inject in place of the real one.
+var FAKE_BODY = '{"chain_tag":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","ciphertext":"","nctr":0,"seq":0,"session_id":"0000000000000000000000000000000000000000000000000000000000000000","type":0}';
 
-function flushIfComplete() {
-    // A complete HTTP request ends with \r\n\r\n plus a body of the declared
-    // Content-Length. Simpler heuristic: if we see both headers and a body
-    // that ends with '}', or the accumulation is large enough, flush.
-    if (!pending) return;
-    var headerEnd = pending.indexOf('\r\n\r\n');
-    if (headerEnd < 0) return;
-
-    var head = pending.substring(0, headerEnd);
-    var body = pending.substring(headerEnd + 4);
-
-    // Parse Content-Length from headers
-    var m = head.match(/Content-Length:\s*(\d+)/i);
-    if (!m) return;
-    var declared = parseInt(m[1], 10);
-
-    // If we have at least Content-Length body bytes, we're done
-    if (body.length >= declared) {
-        body = body.substring(0, declared);
-        emit({
-            type: 'record_request',
-            headers: head,
-            body: body,
-            total: pending.length,
-            declared_len: declared,
-            when: Date.now()
-        });
-        pending = '';
-        pendingStartTs = 0;
-    }
-}
+// Track whether the current plaintext blob we see belongs to the target URL.
+// Because Schannel can split a single request across multiple buffers, we
+// keep a small state machine: once we see the target path in a buffer, the
+// next buffer whose content starts with '{"chain_tag"' is the body.
+var armed = false;
+var patchedCount = 0;
 
 function parseSecBufferDesc(pDesc) {
     try {
@@ -118,21 +76,41 @@ function parseSecBufferDesc(pDesc) {
             if (!data) continue;
             const ascii = u8ToStr(data);
 
-            // Fast filter: only accumulate if we're plausibly looking at
-            // either the start of a request or a continuation of one we
-            // already started.
-            if (pending) {
-                pending += ascii;
-                flushIfComplete();
-                return;
+            // Arm on the request line
+            if (ascii.indexOf('POST ' + TARGET) >= 0 ||
+                ascii.indexOf('POST ' + TARGET) === 0) {
+                armed = true;
+                emit({ type: 'log', m: 'armed on ' + ascii.substring(0, 80) });
+                continue;
             }
-            // Look for the target path in the first 256 bytes
-            if (ascii.indexOf(TARGET) >= 0 && /^POST\s/i.test(ascii)) {
-                seqCounter++;
-                pendingStartTs = Date.now();
-                pending = ascii;
-                flushIfComplete();
-                return;
+            if (!armed) continue;
+
+            // The body follows in a separate buffer, starting with '{"chain_tag"'
+            if (ascii.indexOf('{"chain_tag"') === 0 ||
+                ascii.indexOf('{"chain_tag"') >= 0) {
+
+                // Build a replacement with the same total length so we don't
+                // break the caller's accounting. Pad with spaces if our fake
+                // is shorter than the original.
+                var original = ascii;
+                var fake = FAKE_BODY;
+                if (fake.length < original.length) {
+                    fake = fake + ' '.repeat(original.length - fake.length);
+                }
+                fake = fake.substring(0, original.length);
+
+                try {
+                    pv.writeUtf8String(fake);
+                    patchedCount++;
+                    emit({ type: 'patched',
+                           n: patchedCount,
+                           original_len: original.length,
+                           original_head: original.substring(0, 120),
+                           new_head: fake.substring(0, 120) });
+                } catch (e) {
+                    emit({ type: 'error', m: 'write failed: ' + e });
+                }
+                armed = false;
             }
         }
     } catch (e) {}
@@ -159,7 +137,7 @@ function waitFor(name, cb, tries) {
 }
 
 setImmediate(function () {
-    console.log('[*] record-watcher loaded pid=' + Process.id);
+    console.log('[*] record-body rewriter loaded pid=' + Process.id);
     waitFor('secur32.dll', function () {
         hookSspi();
         console.log('[*] hooks installed');
@@ -173,44 +151,17 @@ def on_message(message, data):
         if message.get('type') == 'error':
             print('[frida error] ' + message.get('description', ''))
         return
-    p = message.get('payload')
-    if not isinstance(p, dict) or p.get('type') != 'record_request':
-        return
-
-    ts = time.strftime('%Y-%m-%d %H:%M:%S')
-    headers = p.get('headers', '')
-    body = p.get('body', '')
-    declared = p.get('declared_len', '?')
-
-    # Pretty print headers
-    print('\n' + '=' * 78)
-    print(f'[{ts}] POST {TARGET_PATH}   body={declared} bytes')
-    print('-' * 78)
-    for line in headers.split('\r\n'):
-        if line.strip():
-            print('  ' + line)
-    print('-' * 78)
-    print('  body:')
-    # Body is JSON; try to pretty-print
-    import json
-    try:
-        obj = json.loads(body)
-        pretty = json.dumps(obj, indent=2)
-        for ln in pretty.split('\n'):
-            print('  ' + ln)
-    except Exception:
-        # Truncate for readability
-        print('  ' + body[:2000].replace('\n', '\n  '))
-
-    # Append to file
-    try:
-        with open(OUT_FILE, 'a', encoding='utf-8') as f:
-            f.write('=' * 78 + '\n')
-            f.write(f'[{ts}] POST {TARGET_PATH}\n')
-            f.write(headers + '\n\n')
-            f.write(body + '\n\n')
-    except Exception as e:
-        print(f'[!] file write failed: {e}')
+    p = message.get('payload') or {}
+    t = p.get('type')
+    ts = time.strftime('%H:%M:%S')
+    if t == 'log':
+        print(f'[{ts}] [LOG] {p.get("m")}')
+    elif t == 'patched':
+        print(f'[{ts}] [PATCHED #{p.get("n")}] original {p.get("original_len")} bytes')
+        print(f'         was: {p.get("original_head")}')
+        print(f'         now: {p.get("new_head")}')
+    elif t == 'error':
+        print(f'[{ts}] [ERROR] {p.get("m")}')
 
 
 def find_detect():
@@ -244,12 +195,6 @@ def attach(pid, name):
 
 
 def main():
-    print(f'[*] Output file: {OUT_FILE}')
-    try:
-        open(OUT_FILE, 'w').close()
-    except Exception:
-        pass
-
     sessions = []
     for e in find_detect():
         r = attach(e['pid'], e['name'])
