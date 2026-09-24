@@ -2,14 +2,13 @@
 """
 sspicli argument probe for detect-fm-<PIN>.exe.
 
-Attaches to detect-fm, hooks ONLY sspicli!EncryptMessage and
-sspicli!DecryptMessage (system DLL exports — never touches the app's own
-module, so an integrity check of the app's .text will not fire), and for
-each call emits the six raw argument pointers plus the first two DWORDs at
-each one. That's enough to identify which argument is the PSecBufferDesc.
+Attaches to detect-fm, hooks ONLY sspicli/secur32/schannel EncryptMessage and
+DecryptMessage (system DLL exports — never touches the app's own module, so
+an integrity check of the app's .text will not fire). For each call it emits
+the six raw argument pointers plus the first two DWORDs at each one, which is
+enough to identify which argument carries the PSecBufferDesc.
 
-No app-module hooks. No ws2_32. No ntdll. No backtrace. No writes to the
-target's memory beyond Frida's normal trampoline on the two system exports.
+Waits for secur32.dll to load before resolving symbols.
 """
 
 import frida
@@ -22,9 +21,12 @@ import psutil
 JS = r"""
 'use strict';
 
+var encCount = 0;
+var decCount = 0;
+
 function emit(p) { try { send(p); } catch (e) {} }
 
-function findExport(mod, sym) {
+function getExport(mod, sym) {
     try {
         if (typeof Module.getExportByName === 'function')
             return Module.getExportByName(mod, sym);
@@ -36,24 +38,33 @@ function findExport(mod, sym) {
     return null;
 }
 
-// Read up to 8 bytes at a pointer and return as "hi/lo" hint string.
-// Never throws.
-function hint(ptr) {
+function getGlobalExport(sym) {
     try {
-        if (!ptr || ptr.isNull()) return 'null';
-        var a = ptr.readU32();
-        var b = ptr.add(4).readU32();
+        if (typeof Module.findGlobalExportByName === 'function')
+            return Module.findGlobalExportByName(sym);
+    } catch (e) {}
+    try {
+        if (typeof Module.findExportByName === 'function')
+            return Module.findExportByName(null, sym);
+    } catch (e) {}
+    return null;
+}
+
+function hint(p) {
+    try {
+        if (!p || p.isNull()) return 'null';
+        var a = p.readU32();
+        var b = p.add(4).readU32();
         return '0x' + (a >>> 0).toString(16) + '/0x' + (b >>> 0).toString(16);
     } catch (e) {
         return '?';
     }
 }
 
-// Read a short ASCII preview if the pointer looks like a C string.
-function preview(ptr) {
+function preview(p) {
     try {
-        if (!ptr || ptr.isNull()) return '';
-        var s = ptr.readCString();
+        if (!p || p.isNull()) return '';
+        var s = p.readCString();
         if (!s) return '';
         var out = '';
         for (var i = 0; i < s.length && i < 80; i++) {
@@ -65,60 +76,90 @@ function preview(ptr) {
     } catch (e) { return ''; }
 }
 
-var encCount = 0;
-var decCount = 0;
-
-function hookProbe(modName, symName, kind) {
-    var addr = findExport(modName, symName);
-    if (!addr) {
-        console.log('[!] ' + modName + '!' + symName + ' not found');
-        return false;
-    }
-    try {
-        Interceptor.attach(addr, {
-            onEnter: function (args) {
-                var n = (kind === 'enc') ? (++encCount) : (++decCount);
-                // Only log first 10 of each so the terminal stays readable.
-                if (n > 10) return;
-
-                var row = {
-                    type: 'args',
-                    kind: kind,
-                    n: n,
-                    where: modName + '!' + symName,
-                    args: [],
-                    hints: [],
-                    previews: []
-                };
-                for (var i = 0; i < 6; i++) {
-                    var p = args[i];
-                    row.args.push(p ? p.toString() : '?');
-                    row.hints.push(hint(p));
-                    row.previews.push(preview(p));
-                }
-                emit(row);
+function attachProbe(addr, where, kind) {
+    Interceptor.attach(addr, {
+        onEnter: function (args) {
+            var n = (kind === 'enc') ? (++encCount) : (++decCount);
+            if (n > 15) return;
+            var row = {
+                type: 'args',
+                kind: kind,
+                n: n,
+                where: where,
+                args: [],
+                hints: [],
+                previews: []
+            };
+            for (var i = 0; i < 6; i++) {
+                var p = args[i];
+                row.args.push(p ? p.toString() : '?');
+                row.hints.push(hint(p));
+                row.previews.push(preview(p));
             }
-        });
-        console.log('[*] hooked ' + modName + '!' + symName);
-        return true;
-    } catch (e) {
-        console.log('[!] hook ' + modName + '!' + symName + ' failed: ' + e);
-        return false;
+            emit(row);
+        }
+    });
+    console.log('[*] hooked ' + where + ' @ ' + addr);
+}
+
+function hookProbe(symName, kind, fallbackOffset) {
+    // 1. Try every module that could export this function.
+    var mods = ['secur32.dll', 'sspicli.dll', 'schannel.dll'];
+    for (var i = 0; i < mods.length; i++) {
+        var a = getExport(mods[i], symName);
+        if (a) {
+            attachProbe(a, mods[i] + '!' + symName, kind);
+            return true;
+        }
     }
+    // 2. Global lookup (across all loaded modules).
+    var g = getGlobalExport(symName);
+    if (g) {
+        attachProbe(g, 'global!' + symName, kind);
+        return true;
+    }
+    // 3. Offset fallback inside sspicli.dll.
+    //    From prior v4 log:
+    //      secur32!EncryptMessage -> 0x7ff878532d70, sspicli base 0x7ff878530000
+    //      secur32!DecryptMessage -> 0x7ff878532cd0, sspicli base 0x7ff878530000
+    try {
+        var mod = null;
+        var names = ['sspicli.dll', 'SSPICLI.DLL', 'Secur32.dll', 'secur32.dll'];
+        for (var j = 0; j < names.length; j++) {
+            try { mod = Process.getModuleByName(names[j]); if (mod) break; } catch (e) {}
+        }
+        if (mod) {
+            var target = mod.base.add(fallbackOffset);
+            attachProbe(target, mod.name + '+0x' + fallbackOffset.toString(16)
+                              + ' (' + symName + ')', kind);
+            return true;
+        }
+    } catch (e) {
+        console.log('[!] offset fallback failed for ' + symName + ': ' + e);
+    }
+    console.log('[!] could not resolve ' + symName);
+    return false;
+}
+
+function waitForModule(name, cb, tries) {
+    tries = tries || 0;
+    try {
+        var m = Process.getModuleByName(name);
+        if (m) { cb(m); return; }
+    } catch (e) {}
+    if (tries > 50) { console.log('[!] gave up waiting for ' + name); cb(null); return; }
+    setTimeout(function () { waitForModule(name, cb, tries + 1); }, 100);
 }
 
 setImmediate(function () {
     console.log('[*] sspicli arg probe loaded (pid=' + Process.id +
                 ', arch=' + Process.arch + ')');
-    // Prefer sspicli.dll — that is where the real code lives. Fall back to
-    // secur32.dll if for some reason sspicli is not loaded.
-    if (!hookProbe('sspicli.dll', 'EncryptMessage', 'enc')) {
-        hookProbe('secur32.dll', 'EncryptMessage', 'enc');
-    }
-    if (!hookProbe('sspicli.dll', 'DecryptMessage', 'dec')) {
-        hookProbe('secur32.dll', 'DecryptMessage', 'dec');
-    }
-    console.log('[*] probes installed');
+    waitForModule('secur32.dll', function (m) {
+        if (m) console.log('[*] secur32.dll present @ ' + m.base);
+        hookProbe('EncryptMessage', 'enc', 0x2d70);
+        hookProbe('DecryptMessage', 'dec', 0x2cd0);
+        console.log('[*] probes installed');
+    });
 });
 """
 
@@ -137,12 +178,13 @@ def on_message(message, data):
         print('\n' + '=' * 78)
         print(f'[{ts}] {kind} #{p.get("n")}  {p.get("where")}')
         print('-' * 78)
-        for i, a in enumerate(p.get('args', [])):
-            h = p.get('hints', [''] * 6)[i]
-            pv = p.get('previews', [''] * 6)[i]
-            line = f'  arg{i}: ptr={a}  head={h}'
-            if pv:
-                line += f'  str="{pv}"'
+        args = p.get('args', [])
+        hints = p.get('hints', [''] * len(args))
+        previews = p.get('previews', [''] * len(args))
+        for i, a in enumerate(args):
+            line = f'  arg{i}: ptr={a}  head={hints[i]}'
+            if previews[i]:
+                line += f'  str="{previews[i]}"'
             print(line)
 
 
