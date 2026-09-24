@@ -1,8 +1,10 @@
 """Block personal-data access via Frida (companion to nefd.py detector).
 
 Fixes applied in this revision:
+  - Comprehensive forensic artifact blocking: SRUM, UserAssist, BAM,
+    Amcache, Prefetch, browser history, RecentDocs, SetupAPI logs,
+    Defender history, and more.
   - Recycle Bin metadata ($I* files) blocked from every filesystem API.
-    This stops scanners from seeing "Recycle Bin Modified".
   - CrashDump folder spoofing: returns a fabricated empty folder path.
   - IFEO paths blocked at registry + event log layers.
   - Elevation artifacts blocked (UAC, UserAssist, AppInfo, FeatureUsage).
@@ -76,7 +78,7 @@ SENSITIVE_DIRS = [
     "\\windows defender\\scans\\history\\service\\detectionhistory\\file",
 ]
 
-# ---- IFEO & Elevation & CrashDump & Recycle Bin registry locations ----
+# ---- Comprehensive forensic artifact registry locations ----
 REG_BLOCK = [
     # ---- Existing forensic trails ----
     "taskcache\\tree\\detectrun",
@@ -137,6 +139,56 @@ REG_BLOCK = [
     "\\microsoft\\windows\\currentversion\\explorer\\featureusage",
     "featureusage",
     "windows defender\\scans\\history\\service\\detectionhistory\\resource",
+
+    # ---- NEW: SRUM Extensions (data usage) ----
+    "\\srum\\extensions",
+
+    # ---- NEW: RecentDocs (recently opened files) ----
+    "\\explorer\\recentdocs",
+
+    # ---- NEW: UserAssist (GUI program execution) ----
+    "\\explorer\\userassist",
+
+    # ---- NEW: BAM/DAM (Background Activity Moderator) ----
+    "\\bam\\state",
+    "\\dam\\state",
+
+    # ---- NEW: Amcache (program execution & file metadata) ----
+    "\\appcompat\\programs\\amcache",
+
+    # ---- NEW: Event log channels (process creation, etc.) ----
+    "\\eventlog\\application",
+    "\\eventlog\\security",
+    "\\eventlog\\system",
+    "\\services\\eventlog\\application",
+    "\\services\\eventlog\\security",
+    "\\services\\eventlog\\system",
+
+    # ---- NEW: Defender scan history ----
+    "\\windows defender\\scans\\history\\service\\detectionhistory",
+    "\\windows defender\\scans\\history\\results",
+
+    # ---- NEW: WMI activity logs ----
+    "\\wbem\\cimom\\logging",
+
+    # ---- NEW: Network profiles (WiFi history) ----
+    "\\networklist\\profiles",
+    "\\networklist\\signatures",
+
+    # ---- NEW: RDP connection history ----
+    "\\terminal server client\\default",
+    "\\terminal server client\\servers",
+
+    # ---- NEW: Map Network Drive MRU ----
+    "\\explorer\\map network drive mru",
+
+    # ---- NEW: VPN/RAS history ----
+    "\\services\\rasman\\parameters",
+    "\\services\\rasman\\config",
+
+    # ---- NEW: Proxy settings (potential history) ----
+    "\\internet settings\\proxyserver",
+    "\\internet settings\\proxyenable",
 ]
 
 VALUE_BLOCK_NAMES = []
@@ -365,16 +417,28 @@ JS = r'''
              l.endsWith('.cer') || l.endsWith('.crt')))
             return 'bypass-remnant';
 
+        // ---- Prefetch (program execution) ----
         if (C.prefetch && l.indexOf('\\prefetch\\') >= 0) return 'prefetch';
 
+        // ---- Event log files (.evtx) ----
         if (C.eventlog && l.indexOf('\\winevt\\') >= 0) return 'eventlog-file';
 
+        // ---- SRUM database (data usage) ----
         if (C.datausage && (l.indexOf('\\sru\\') >= 0 || l.indexOf('srudb.dat') >= 0 || l.indexOf('srumpe2scan') >= 0)) return 'datausage-sru';
 
-        // ---- NEW: Recycle Bin metadata ($I* info files) ----
-        // Every deletion writes a $I<id> file (and $R<id>) under $Recycle.Bin.
-        // Forensics tools read $I files to reconstruct deletion history.
-        // Blocking them makes the bin look untouched.
+        // ---- Amcache.hve (program execution, file metadata) ----
+        if (l.indexOf('\\appcompat\\programs\\amcache.hve') >= 0) return 'amcache-hive';
+
+        // ---- SetupAPI logs (device/app install) ----
+        if (l.indexOf('\\inf\\setupapi.') >= 0 && l.endsWith('.log')) return 'setupapi-log';
+
+        // ---- WMI activity logs ----
+        if (l.indexOf('\\wbem\\logs\\') >= 0 || l.indexOf('\\wbem\\cimom\\') >= 0) return 'wmi-log';
+
+        // ---- Windows Defender history ----
+        if (l.indexOf('\\windows defender\\scans\\history') >= 0) return 'defender-history';
+
+        // ---- Recycle Bin metadata ($I* info files) ----
         if (l.indexOf('$recycle.bin') >= 0) {
             var rbBase = basenameOf(l);
             if (rbBase.indexOf('$i') === 0 || rbBase.indexOf('$r') === 0) {
@@ -382,6 +446,7 @@ JS = r'''
             }
         }
 
+        // ---- NEW: Browser history databases (Edge, Chrome, etc.) ----
         var BROWSER_SUBSTR = [
             '\\google\\chrome\\user data', '\\microsoft\\edge\\user data',
             '\\bravesoftware\\brave-browser\\user data',
@@ -403,6 +468,10 @@ JS = r'''
                 for (var j = 0; j < BROWSER_FILES.length; j++) if (base === BROWSER_FILES[j]) return 'browser-history';
             }
         }
+
+        // ---- NEW: Timeline / Activity History ----
+        if (l.indexOf('\\connecteddevicesplatform\\') >= 0 && l.endsWith('activitiescache.db')) return 'timeline-activities';
+
         return null;
     }
 
@@ -560,7 +629,6 @@ JS = r'''
         if (isHiddenTaskName(ctx)) return true;
         if (ctx.indexOf('\\prefetch\\') >= 0) return true;
         if (ctx.indexOf('\\winevt\\') >= 0 && l.endsWith('.evtx')) return true;
-        // ---- NEW: hide $I / $R entries when enumerating $Recycle.Bin ----
         if (ctx.indexOf('$recycle.bin') >= 0) {
             if (l.indexOf('$i') === 0 || l.indexOf('$r') === 0) return true;
         }
