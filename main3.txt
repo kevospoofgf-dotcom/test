@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+"""
+Watch for POSTs to /auth/api/scanning/v2/record from detect-fm-<PIN>.exe.
+Hooks sspicli!EncryptMessage (system DLL export — does not touch the app
+module), parses the plaintext buffer, and for every request whose first
+line targets the record endpoint, writes the full request to a file and
+prints a summary.
+
+Run elevated. Ctrl+C to exit.
+"""
+
+import frida
+import sys
+import time
+import os
+import tempfile
+import psutil
+
+# Where to write the matched requests
+OUT_DIR = tempfile.gettempdir()
+OUT_FILE = os.path.join(OUT_DIR, 'scanning_records.log')
+
+TARGET_PATH = '/auth/api/scanning/v2/record'
+
+
+JS = r"""
+'use strict';
+
+function emit(p) { try { send(p); } catch (e) {} }
+
+function findExport(mod, sym) {
+    try { return Module.getExportByName(mod, sym); } catch (e) {}
+    try { return Module.findExportByName(mod, sym); } catch (e) {}
+    return null;
+}
+function getGlobalExport(sym) {
+    try { return Module.findGlobalExportByName(sym); } catch (e) {}
+    try { return Module.findExportByName(null, sym); } catch (e) {}
+    return null;
+}
+
+function readMem(ptr, len) {
+    try {
+        if (!ptr || ptr.isNull() || len <= 0 || len > 0x100000) return null;
+        return new Uint8Array(ptr.readByteArray(len));
+    } catch (e) { return null; }
+}
+function u8ToStr(u8) {
+    let s = '';
+    for (let i = 0; i < u8.length; i++) {
+        const c = u8[i];
+        if (c === 0) break;
+        s += String.fromCharCode(c);
+    }
+    return s;
+}
+
+var TARGET = '/auth/api/scanning/v2/record';
+var seqCounter = 0;
+
+// Accumulate bytes across multiple EncryptMessage calls belonging to the
+// same logical HTTP request. A single request can be split into multiple
+// buffers by Schannel when the body exceeds the TLS record size.
+var pending = '';           // accumulating plaintext
+var pendingStartTs = 0;     // when the current accumulation began
+
+function flushIfComplete() {
+    // A complete HTTP request ends with \r\n\r\n plus a body of the declared
+    // Content-Length. Simpler heuristic: if we see both headers and a body
+    // that ends with '}', or the accumulation is large enough, flush.
+    if (!pending) return;
+    var headerEnd = pending.indexOf('\r\n\r\n');
+    if (headerEnd < 0) return;
+
+    var head = pending.substring(0, headerEnd);
+    var body = pending.substring(headerEnd + 4);
+
+    // Parse Content-Length from headers
+    var m = head.match(/Content-Length:\s*(\d+)/i);
+    if (!m) return;
+    var declared = parseInt(m[1], 10);
+
+    // If we have at least Content-Length body bytes, we're done
+    if (body.length >= declared) {
+        body = body.substring(0, declared);
+        emit({
+            type: 'record_request',
+            headers: head,
+            body: body,
+            total: pending.length,
+            declared_len: declared,
+            when: Date.now()
+        });
+        pending = '';
+        pendingStartTs = 0;
+    }
+}
+
+function parseSecBufferDesc(pDesc) {
+    try {
+        if (!pDesc || pDesc.isNull()) return;
+        const cBuffers = pDesc.add(4).readU32();
+        if (cBuffers < 1 || cBuffers > 16) return;
+        const bufArray = pDesc.add(8).readPointer();
+        if (!bufArray || bufArray.isNull()) return;
+        const stride = 16;
+        for (let i = 0; i < cBuffers; i++) {
+            const entry = bufArray.add(i * stride);
+            let cb = 0, type = 0, pv = null;
+            try {
+                cb = entry.readU32();
+                type = entry.add(4).readU32();
+                pv = entry.add(8).readPointer();
+            } catch (e) { continue; }
+            if (type !== 0x01 && type !== 0x07) continue;
+            if (cb === 0 || cb > 0x100000) continue;
+            const data = readMem(pv, cb);
+            if (!data) continue;
+            const ascii = u8ToStr(data);
+
+            // Fast filter: only accumulate if we're plausibly looking at
+            // either the start of a request or a continuation of one we
+            // already started.
+            if (pending) {
+                pending += ascii;
+                flushIfComplete();
+                return;
+            }
+            // Look for the target path in the first 256 bytes
+            if (ascii.indexOf(TARGET) >= 0 && /^POST\s/i.test(ascii)) {
+                seqCounter++;
+                pendingStartTs = Date.now();
+                pending = ascii;
+                flushIfComplete();
+                return;
+            }
+        }
+    } catch (e) {}
+}
+
+function hookSspi() {
+    const enc = getGlobalExport('EncryptMessage')
+             || findExport('secur32.dll', 'EncryptMessage')
+             || findExport('sspicli.dll', 'EncryptMessage');
+    if (!enc) { console.log('[!] EncryptMessage not found'); return; }
+    Interceptor.attach(enc, {
+        onEnter(args) {
+            parseSecBufferDesc(args[2]);
+        }
+    });
+    console.log('[*] hooked EncryptMessage @ ' + enc);
+}
+
+function waitFor(name, cb, tries) {
+    tries = tries || 0;
+    try { if (Process.getModuleByName(name)) { cb(); return; } } catch (e) {}
+    if (tries > 50) { cb(); return; }
+    setTimeout(function () { waitFor(name, cb, tries + 1); }, 100);
+}
+
+setImmediate(function () {
+    console.log('[*] record-watcher loaded pid=' + Process.id);
+    waitFor('secur32.dll', function () {
+        hookSspi();
+        console.log('[*] hooks installed');
+    });
+});
+"""
+
+
+def on_message(message, data):
+    if message.get('type') != 'send':
+        if message.get('type') == 'error':
+            print('[frida error] ' + message.get('description', ''))
+        return
+    p = message.get('payload')
+    if not isinstance(p, dict) or p.get('type') != 'record_request':
+        return
+
+    ts = time.strftime('%Y-%m-%d %H:%M:%S')
+    headers = p.get('headers', '')
+    body = p.get('body', '')
+    declared = p.get('declared_len', '?')
+
+    # Pretty print headers
+    print('\n' + '=' * 78)
+    print(f'[{ts}] POST {TARGET_PATH}   body={declared} bytes')
+    print('-' * 78)
+    for line in headers.split('\r\n'):
+        if line.strip():
+            print('  ' + line)
+    print('-' * 78)
+    print('  body:')
+    # Body is JSON; try to pretty-print
+    import json
+    try:
+        obj = json.loads(body)
+        pretty = json.dumps(obj, indent=2)
+        for ln in pretty.split('\n'):
+            print('  ' + ln)
+    except Exception:
+        # Truncate for readability
+        print('  ' + body[:2000].replace('\n', '\n  '))
+
+    # Append to file
+    try:
+        with open(OUT_FILE, 'a', encoding='utf-8') as f:
+            f.write('=' * 78 + '\n')
+            f.write(f'[{ts}] POST {TARGET_PATH}\n')
+            f.write(headers + '\n\n')
+            f.write(body + '\n\n')
+    except Exception as e:
+        print(f'[!] file write failed: {e}')
+
+
+def find_detect():
+    out = []
+    for p in psutil.process_iter(['pid', 'name']):
+        try:
+            if 'detect-fm' in (p.info['name'] or '').lower():
+                out.append(p.info)
+        except Exception:
+            pass
+    return out
+
+
+def attach(pid, name):
+    print(f'\n[+] Attaching to {name} (pid={pid})')
+    try:
+        session = frida.attach(pid)
+    except Exception as e:
+        print(f'[!] attach failed: {e}')
+        return None
+    script = session.create_script(JS)
+    script.on('message', on_message)
+    try:
+        script.load()
+    except Exception as e:
+        print(f'[!] script.load failed: {e}')
+        try: session.detach()
+        except Exception: pass
+        return None
+    return session, script
+
+
+def main():
+    print(f'[*] Output file: {OUT_FILE}')
+    try:
+        open(OUT_FILE, 'w').close()
+    except Exception:
+        pass
+
+    sessions = []
+    for e in find_detect():
+        r = attach(e['pid'], e['name'])
+        if r:
+            sessions.append(r)
+
+    if not sessions:
+        print('[*] Waiting for detect-fm (Ctrl+C to quit)...')
+        known = set()
+        try:
+            while True:
+                for e in find_detect():
+                    if e['pid'] in known:
+                        continue
+                    r = attach(e['pid'], e['name'])
+                    if r:
+                        known.add(e['pid'])
+                        sessions.append(r)
+                time.sleep(2)
+        except KeyboardInterrupt:
+            pass
+    else:
+        print('\n[*] Monitoring. Ctrl+C to exit.')
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            pass
+
+    for s, sc in sessions:
+        try: sc.unload()
+        except Exception: pass
+        try: s.detach()
+        except Exception: pass
+
+
+if __name__ == '__main__':
+    main()
