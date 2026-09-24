@@ -1,12 +1,13 @@
 r"""Block personal-data access via Frida (companion to nefd.py detector).
 
 Fixes applied in this revision:
+  - USB hook simplified: SetupDiGetClassDevs* hooks removed (they caused the
+    scanner to hang in an enumeration-retry loop). GetDriveTypeW/A now
+    returns DRIVE_FIXED for non-system drives without calling GetLogicalDrives.
   - AutoModeDetect processes excluded from Frida attachment.
   - CrashDump folder (%LOCALAPPDATA%\CrashDumps) blocked from every FS API.
-  - USN journal query returns a fabricated healthy USN_JOURNAL_DATA_V0
-    (MaximumSize = 512MB) so "Shrunk Below Windows Minimum" stops firing.
-  - USN read returns a fabricated USN_RECORD_V2 so "Not Recording File
-    Activity" stops firing.
+  - USN journal query returns a fabricated healthy USN_JOURNAL_DATA_V0.
+  - USN read returns a fabricated USN_RECORD_V2.
   - Recycle Bin metadata ($I* files) blocked from every filesystem API.
   - IFEO paths blocked at registry + event log layers.
   - Elevation artifacts blocked (UAC, UserAssist, AppInfo, FeatureUsage).
@@ -32,15 +33,12 @@ import ctypes
 
 SUBSTR = "detect"
 
-# ---- Process names to never attach to (case-insensitive substring match).
-# Any process whose exe name contains one of these strings is skipped.
 ATTACH_EXCLUDE_SUBSTR = [
-    "autodetecd",       # note: also matches "AutoModeDetect" via substring
+    "autodetecd",
     "autodetec",
     "automodedetect",
     "automodedetec",
     "automodedetct",
-    "automodedetect.exe",
 ]
 
 BLOCK_EVENTLOG         = True
@@ -91,7 +89,6 @@ SENSITIVE_DIRS = [
 ]
 
 REG_BLOCK = [
-    # ---- Existing forensic trails ----
     "taskcache\\tree\\detectrun",
     "taskcache\\tree\\microsoft\\windows\\detectrun",
     "powershell\\psreadline",
@@ -120,15 +117,11 @@ REG_BLOCK = [
     "windows defender\\scans\\",
     "windows defender\\threats",
     "windows defender\\quarantine",
-
-    # ---- IFEO ----
     "image file execution options",
     "silentprocessexit",
     "ifeo",
     "debugger",
     "monitorprocess",
-
-    # ---- CrashDump configuration ----
     "windows error reporting\\localdumps",
     "localdumps",
     "crashcontrol",
@@ -136,8 +129,6 @@ REG_BLOCK = [
     "dumpfile",
     "dedicateddumpfile",
     "\\software\\microsoft\\windows\\windows error reporting",
-
-    # ---- Elevation artifacts ----
     "\\windows\\currentversion\\uac",
     "currentversion\\uac",
     "\\policies\\system",
@@ -151,51 +142,27 @@ REG_BLOCK = [
     "\\microsoft\\windows\\currentversion\\explorer\\featureusage",
     "featureusage",
     "windows defender\\scans\\history\\service\\detectionhistory\\resource",
-
-    # ---- SRUM Extensions ----
     "\\srum\\extensions",
-
-    # ---- RecentDocs ----
     "\\explorer\\recentdocs",
-
-    # ---- BAM/DAM ----
     "\\bam\\state",
     "\\dam\\state",
-
-    # ---- Amcache ----
     "\\appcompat\\programs\\amcache",
-
-    # ---- Event log channels ----
     "\\eventlog\\application",
     "\\eventlog\\security",
     "\\eventlog\\system",
     "\\services\\eventlog\\application",
     "\\services\\eventlog\\security",
     "\\services\\eventlog\\system",
-
-    # ---- Defender scan history ----
     "\\windows defender\\scans\\history\\service\\detectionhistory",
     "\\windows defender\\scans\\history\\results",
-
-    # ---- WMI activity logs ----
     "\\wbem\\cimom\\logging",
-
-    # ---- Network profiles ----
     "\\networklist\\profiles",
     "\\networklist\\signatures",
-
-    # ---- RDP connection history ----
     "\\terminal server client\\default",
     "\\terminal server client\\servers",
-
-    # ---- Map Network Drive MRU ----
     "\\explorer\\map network drive mru",
-
-    # ---- VPN/RAS history ----
     "\\services\\rasman\\parameters",
     "\\services\\rasman\\config",
-
-    # ---- Proxy settings ----
     "\\internet settings\\proxyserver",
     "\\internet settings\\proxyenable",
 ]
@@ -427,19 +394,12 @@ JS = r'''
             return 'bypass-remnant';
 
         if (C.prefetch && l.indexOf('\\prefetch\\') >= 0) return 'prefetch';
-
         if (C.eventlog && l.indexOf('\\winevt\\') >= 0) return 'eventlog-file';
-
         if (C.datausage && (l.indexOf('\\sru\\') >= 0 || l.indexOf('srudb.dat') >= 0 || l.indexOf('srumpe2scan') >= 0)) return 'datausage-sru';
-
         if (l.indexOf('\\appcompat\\programs\\amcache.hve') >= 0) return 'amcache-hive';
-
         if (l.indexOf('\\inf\\setupapi.') >= 0 && l.endsWith('.log')) return 'setupapi-log';
-
         if (l.indexOf('\\wbem\\logs\\') >= 0 || l.indexOf('\\wbem\\cimom\\') >= 0) return 'wmi-log';
-
         if (l.indexOf('\\windows defender\\scans\\history') >= 0) return 'defender-history';
-
         if (l.indexOf('\\crashdumps\\') >= 0) return 'crashdump-folder';
         if (l.endsWith('\\crashdumps')) return 'crashdump-folder';
 
@@ -883,51 +843,39 @@ JS = r'''
     } catch (e) { log("[!] systemDrive probe failed: " + e); }
     log("[*] systemDrive = " + systemDrive);
 
-    var _driveMask = 0;
-    var _driveMaskTs = 0;
-    function refreshDriveMask() {
-        var now = Date.now();
-        if (now - _driveMaskTs < 5000 && _driveMask !== 0) return;
-        try {
-            var f = new NativeFunction(
-                Module.getExportByName('kernel32.dll', 'GetLogicalDrives'),
-                'uint32', []
-            );
-            _driveMask = f() >>> 0;
-            _driveMaskTs = now;
-        } catch (e) { _driveMask = 1; }
-    }
-    function letterExists(letter) {
-        var idx = letter.charCodeAt(0) - 97;
-        if (idx < 0 || idx > 25) return false;
-        return (_driveMask & (1 << idx)) !== 0;
-    }
+    // ---- SIMPLIFIED USB hook (no SetupAPI, no GetLogicalDrives) ----
+    // The previous version called SetupDiGetClassDevsW and returned
+    // INVALID_HANDLE_VALUE, which caused the scanner to spin in an
+    // enumeration-retry loop. It also called GetLogicalDrives on every
+    // GetDriveType call, which was slow.
+    //
+    // New behavior: only GetDriveTypeW/A is hooked. Any drive letter
+    // that is NOT the system drive is reported as DRIVE_FIXED (3),
+    // never DRIVE_REMOVABLE (2). SetupAPI is left untouched.
     if (C.usb) {
-        hook('kernel32.dll', 'GetDriveTypeW', function (a) { this._d = ws(a[0]); }, function (r) {
-            var l = normPath(this._d || '');
-            if (systemDrive && l.indexOf(systemDrive) === 0) return;
-            if (l.length >= 2 && l.charAt(1) === ':') {
-                refreshDriveMask();
-                if (!letterExists(l.charAt(0))) { r.replace(1); return; }
-                r.replace(3); blocked('GetDriveTypeW', this._d || '');
+        hook('kernel32.dll', 'GetDriveTypeW', function (a) {
+            try { this._d = ws(a[0]); } catch (e) { this._d = null; }
+        }, function (r) {
+            var raw = low(this._d || '');
+            if (raw.length < 2 || raw.charAt(1) !== ':') return;
+            // Never touch the system drive
+            if (systemDrive && raw.indexOf(systemDrive) === 0) return;
+            // Report fixed disk for any other drive letter
+            if (r.toInt32() === 2 /* DRIVE_REMOVABLE */) {
+                r.replace(3);  // DRIVE_FIXED
+                blocked('GetDriveTypeW', raw);
             }
         });
-        hook('kernel32.dll', 'GetDriveTypeA', function (a) { this._d = as(a[0]); }, function (r) {
-            var l = normPath(this._d || '');
-            if (systemDrive && l.indexOf(systemDrive) === 0) return;
-            if (l.length >= 2 && l.charAt(1) === ':') {
-                refreshDriveMask();
-                if (!letterExists(l.charAt(0))) { r.replace(1); return; }
-                r.replace(3); blocked('GetDriveTypeA', this._d || '');
+        hook('kernel32.dll', 'GetDriveTypeA', function (a) {
+            try { this._d = as(a[0]); } catch (e) { this._d = null; }
+        }, function (r) {
+            var raw = low(this._d || '');
+            if (raw.length < 2 || raw.charAt(1) !== ':') return;
+            if (systemDrive && raw.indexOf(systemDrive) === 0) return;
+            if (r.toInt32() === 2) {
+                r.replace(3);
+                blocked('GetDriveTypeA', raw);
             }
-        });
-        ['SetupDiGetClassDevsW', 'SetupDiGetClassDevsA', 'SetupDiGetClassDevsExW', 'SetupDiGetClassDevsExA'].forEach(function (n) {
-            var isW = n.endsWith('W') || n.endsWith('ExW');
-            hook('setupapi.dll', n, function (a) {
-                try { this._d = isW ? ws(a[0]) : as(a[0]); } catch (e) {}
-            }, function (r) {
-                if (!r.isNull()) { r.replace(ptr(-1)); setErr(18); blocked(n, this._d || ''); }
-            });
         });
     }
 
@@ -1139,7 +1087,6 @@ def on_msg(m, d):
         log_line(f"[?] {json.dumps(p)}")
 
 def _is_excluded_process(name):
-    """Return True if this process name should never be attached to."""
     if not name:
         return False
     n = name.lower()
