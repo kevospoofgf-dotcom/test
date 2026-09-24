@@ -4,7 +4,9 @@ Capture decrypted TLS traffic from detect-fm-<PIN>.exe.
 
 Hooks sspicli/secur32!EncryptMessage and DecryptMessage (system exports only
 — app module is never touched), parses the PSecBufferDesc correctly, and
-prints the plaintext HTTP/JSON before encryption and after decryption.
+logs plaintext HTTP/JSON before encryption and after decryption.
+
+Writes to %TEMP%\\debug.log (live) and %TEMP%\\debug.jsonl (structured).
 """
 
 import frida
@@ -12,6 +14,8 @@ import sys
 import time
 import json
 import re
+import os
+import tempfile
 import psutil
 
 try:
@@ -21,11 +25,50 @@ except ImportError:
     HAVE_PYCRYPTO = False
 
 
+# ---------------------------------------------------------------------------
+# Log file paths — %TEMP%\debug.log on Windows, /tmp/debug.log elsewhere.
+# ---------------------------------------------------------------------------
+_LOG_DIR = tempfile.gettempdir()
+_LOG_TXT = os.path.join(_LOG_DIR, 'debug.log')
+_LOG_JSONL = os.path.join(_LOG_DIR, 'debug.jsonl')
+
+# Truncate at start of each run so the file is clean for the next upload.
+try:
+    with open(_LOG_TXT, 'w', encoding='utf-8') as f:
+        f.write(f'# detect-fm capture — started {time.strftime("%Y-%m-%d %H:%M:%S")}\n')
+    with open(_LOG_JSONL, 'w', encoding='utf-8') as f:
+        f.write('')
+except Exception as e:
+    print(f'[!] could not open log files: {e}')
+
+
+_LOG_TXT_F = open(_LOG_TXT, 'a', encoding='utf-8', errors='replace')
+_LOG_JSONL_F = open(_LOG_JSONL, 'a', encoding='utf-8', errors='replace')
+
+
+def log_write_txt(s):
+    """Append a line to debug.log with a timestamp, flush immediately."""
+    try:
+        ts = time.strftime('%H:%M:%S')
+        _LOG_TXT_F.write(f'[{ts}] {s}\n')
+        _LOG_TXT_F.flush()
+    except Exception:
+        pass
+
+
+def log_write_jsonl(obj):
+    """Append a JSON object as one line to debug.jsonl."""
+    try:
+        _LOG_JSONL_F.write(json.dumps(obj, ensure_ascii=False) + '\n')
+        _LOG_JSONL_F.flush()
+    except Exception:
+        pass
+
+
 JS = r"""
 'use strict';
 
 function emit(p) { try { send(p); } catch (e) {} }
-
 function ts() { return new Date().toISOString(); }
 
 function bytesToHex(b) {
@@ -73,15 +116,11 @@ function getExport(mod, sym) {
     return null;
 }
 
-// Correct SecBufferDesc layout on x64:
-//   +0   ULONG      ulVersion    (usually 0)
-//   +4   ULONG      cBuffers     (buffer count)
-//   +8   PSecBuffer pBuffers     (array pointer)
-// Each SecBuffer is 16 bytes: { ULONG cbBuffer; ULONG BufferType; PVOID pvBuffer; }
 function parseSecBufferDesc(pDesc, api, direction) {
     try {
         if (!pDesc || pDesc.isNull()) return;
-        const cBuffers = pDesc.add(4).readU32();
+        const ulVersion = pDesc.readU32();
+        const cBuffers  = pDesc.add(4).readU32();
         if (cBuffers < 1 || cBuffers > 16) return;
         const bufArray = pDesc.add(8).readPointer();
         if (!bufArray || bufArray.isNull()) return;
@@ -96,7 +135,6 @@ function parseSecBufferDesc(pDesc, api, direction) {
                 pvBuffer = entry.add(8).readPointer();
             } catch (e) { continue; }
 
-            // 0x01 = SECBUFFER_DATA, 0x07 = SECBUFFER_STREAM
             if (bufType !== 0x01 && bufType !== 0x07) continue;
             if (cbBuffer === 0 || cbBuffer > 0x100000) continue;
 
@@ -118,41 +156,34 @@ function parseSecBufferDesc(pDesc, api, direction) {
 }
 
 function hookSspi() {
-    // EncryptMessage(PCtxtHandle, ULONG, PSecBufferDesc, ULONG) → args[2]
     const encAddr = getGlobalExport('EncryptMessage')
                  || getExport('secur32.dll', 'EncryptMessage')
                  || getExport('sspicli.dll', 'EncryptMessage');
     if (encAddr) {
-        try {
-            Interceptor.attach(encAddr, {
-                onEnter(args) {
-                    parseSecBufferDesc(args[2], 'EncryptMessage', 'out');
-                }
-            });
-            console.log('[*] hooked EncryptMessage @ ' + encAddr);
-        } catch (e) { console.log('[!] hook EncryptMessage: ' + e); }
+        Interceptor.attach(encAddr, {
+            onEnter(args) {
+                parseSecBufferDesc(args[2], 'EncryptMessage', 'out');
+            }
+        });
+        console.log('[*] hooked EncryptMessage @ ' + encAddr);
     } else {
         console.log('[!] EncryptMessage not resolved');
     }
 
-    // DecryptMessage(PCtxtHandle, PSecBufferDesc, ULONG, PULONG) → args[1]
     const decAddr = getGlobalExport('DecryptMessage')
                  || getExport('secur32.dll', 'DecryptMessage')
                  || getExport('sspicli.dll', 'DecryptMessage');
     if (decAddr) {
-        try {
-            Interceptor.attach(decAddr, {
-                onEnter(args) {
-                    this.pDesc = args[1];
-                },
-                onLeave(retval) {
-                    // SEC_E_OK == 0; plaintext is now in the DATA buffer.
-                    if (retval.toInt32() !== 0) return;
-                    parseSecBufferDesc(this.pDesc, 'DecryptMessage', 'in');
-                }
-            });
-            console.log('[*] hooked DecryptMessage @ ' + decAddr);
-        } catch (e) { console.log('[!] hook DecryptMessage: ' + e); }
+        Interceptor.attach(decAddr, {
+            onEnter(args) {
+                this.pDesc = args[1];
+            },
+            onLeave(retval) {
+                if (retval.toInt32() !== 0) return;
+                parseSecBufferDesc(this.pDesc, 'DecryptMessage', 'in');
+            }
+        });
+        console.log('[*] hooked DecryptMessage @ ' + decAddr);
     } else {
         console.log('[!] DecryptMessage not resolved');
     }
@@ -168,7 +199,7 @@ function waitForModule(name, cb, tries) {
 }
 
 setImmediate(function () {
-    console.log('[*] capture agent v6 loaded (pid=' + Process.id + ')');
+    console.log('[*] capture agent v7 loaded (pid=' + Process.id + ')');
     waitForModule('secur32.dll', function () {
         hookSspi();
         console.log('[*] hooks installed');
@@ -191,8 +222,11 @@ def looks_like_json(s):
 def on_message(message, data):
     if message.get('type') != 'send':
         if message.get('type') == 'error':
-            print('[frida error] ' + message.get('description', ''))
+            msg = '[frida error] ' + message.get('description', '')
+            print(msg)
+            log_write_txt(msg)
         return
+
     p = message.get('payload')
     if not isinstance(p, dict):
         return
@@ -200,33 +234,51 @@ def on_message(message, data):
         return
 
     kind = p.get('kind', '')
-    d = p.get('data', {})
+    payload_data = p.get('data', {})
     t = p.get('timestamp', '')
-    api = d.get('api', '?')
-    length = d.get('length', '?')
-    ascii_str = d.get('ascii', '') or ''
+    api = payload_data.get('api', '?')
+    length = payload_data.get('length', '?')
+    ascii_str = payload_data.get('ascii', '') or ''
+    hex_str = payload_data.get('hex', '')
 
-    # Only print plaintext that has a real run of printable ASCII
+    # Filter: only keep events with a readable ASCII run
+    printable_run = 0
     max_run = 0
-    run = 0
-    for ch in ascii_str[:256]:
+    for ch in ascii_str[:512]:
         c = ord(ch)
         if 32 <= c < 127 or c in (9, 10, 13):
-            run += 1
-            if run > max_run: max_run = run
+            printable_run += 1
+            if printable_run > max_run: max_run = printable_run
         else:
-            run = 0
-    if max_run < 16:
+            printable_run = 0
+
+    is_interesting = max_run >= 8
+
+    # Always write to JSONL (even uninteresting — useful for reviewing raw bytes later)
+    log_write_jsonl({
+        'ts': t,
+        'kind': kind,
+        'api': api,
+        'length': length,
+        'ascii': ascii_str,
+        'hex': hex_str,
+    })
+
+    if not is_interesting:
         return
 
-    print('\n' + '=' * 78)
-    print(f'[{t}] {kind.upper():<26} {api}  len={length}')
-    print('-' * 78)
+    # Console + text log for readable content
+    header = f'\n{"=" * 78}\n[{t}] {kind.upper():<26} {api}  len={length}\n{"-" * 78}'
+    print(header)
     print('ASCII: ' + repr(ascii_str[:600]))
+    log_write_txt(header)
+    log_write_txt('ASCII: ' + repr(ascii_str[:600]))
+
     if looks_like_json(ascii_str):
         try:
-            print('JSON:')
-            print(json.dumps(json.loads(ascii_str), indent=2)[:4000])
+            pretty = json.dumps(json.loads(ascii_str), indent=2)[:4000]
+            print('JSON:\n' + pretty)
+            log_write_txt('JSON:\n' + pretty)
         except Exception:
             pass
 
@@ -244,26 +296,37 @@ def find_detect_processes():
 
 
 def attach_and_run(pid, name):
-    print(f'\n[+] Attaching to {name} (pid={pid})')
+    msg = f'\n[+] Attaching to {name} (pid={pid})'
+    print(msg)
+    log_write_txt(msg)
     try:
         session = frida.attach(pid)
     except Exception as e:
-        print(f'[!] attach failed: {e}')
+        m = f'[!] attach failed: {e}'
+        print(m); log_write_txt(m)
         return None
     script = session.create_script(JS)
     script.on('message', on_message)
     try:
         script.load()
     except Exception as e:
-        print(f'[!] script.load failed: {e}')
+        m = f'[!] script.load failed: {e}'
+        print(m); log_write_txt(m)
         try: session.detach()
         except Exception: pass
         return None
-    print(f'[+] Instrumented pid={pid}')
+    m = f'[+] Instrumented pid={pid}'
+    print(m); log_write_txt(m)
     return session, script
 
 
 def main():
+    print(f'[*] Writing logs to:')
+    print(f'    text   -> {_LOG_TXT}')
+    print(f'    jsonl  -> {_LOG_JSONL}')
+    log_write_txt(f'[*] text log:  {_LOG_TXT}')
+    log_write_txt(f'[*] jsonl log: {_LOG_JSONL}')
+
     device = frida.get_local_device()
     print(f'[*] Using device: {device}')
 
@@ -302,6 +365,13 @@ def main():
         except Exception: pass
         try: sess.detach()
         except Exception: pass
+
+    log_write_txt('[*] session ended')
+    try:
+        _LOG_TXT_F.close()
+        _LOG_JSONL_F.close()
+    except Exception:
+        pass
 
 
 if __name__ == '__main__':
