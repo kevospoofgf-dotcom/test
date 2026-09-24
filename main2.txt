@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 Frida script to find 'detect-fm-<PIN>' processes and monitor network traffic.
-Hooks Windows Schannel (EncryptMessage/DecryptMessage) to capture PLAINTEXT
-before TLS encryption and after TLS decryption.
-Compatible with Frida 17.x on Windows / Linux / macOS.
+Hooks Windows Schannel (EncryptMessage/DecryptMessage + async variants) to
+capture PLAINTEXT before TLS encryption and after TLS decryption.
+Compatible with Frida 17.x on Windows.
 """
 
 import frida
@@ -112,21 +112,98 @@ function dumpModules() {
 }
 
 // -----------------------------------------------------------------
-// Windows Schannel hooks — plaintext before/after TLS
+// Schannel SecBufferDesc parser (shared between sync and async hooks)
+// -----------------------------------------------------------------
+function parseSecBufferDesc(pBuffers, api, direction) {
+    try {
+        if (!pBuffers || pBuffers.isNull()) return;
+        const cBuffers = pBuffers.readU32();
+        if (cBuffers <= 0 || cBuffers > 64) {
+            console.log('[!] ' + api + ' suspicious cBuffers=' + cBuffers);
+            return;
+        }
+        const bufArray = pBuffers.add(Process.pointerSize).readPointer();
+        if (!bufArray || bufArray.isNull()) return;
+
+        // SecBuffer struct on x64: { ULONG cbBuffer; ULONG BufferType; PVOID pvBuffer; }
+        // Total = 4 + 4 + 8 = 16 bytes, but the 8-byte pointer is 8-byte aligned,
+        // so on the wire it's {ULONG, ULONG, PVOID} = 16 bytes.
+        const stride = 16;
+
+        for (let i = 0; i < cBuffers; i++) {
+            const entry = bufArray.add(i * stride);
+            let cbBuffer = 0, bufType = 0, pvBuffer = null;
+            try {
+                cbBuffer = entry.readU32();
+                bufType  = entry.add(4).readU32();
+                pvBuffer = entry.add(8).readPointer();
+            } catch (e) {
+                continue;
+            }
+
+            // Diagnostic dump
+            emit({
+                type: 'schannel_debug',
+                api: api,
+                direction: direction,
+                index: i,
+                bufType: '0x' + bufType.toString(16),
+                cbBuffer: cbBuffer
+            });
+
+            // 0x01 = SECBUFFER_DATA (the payload)
+            // 0x05 = SECBUFFER_TOKEN (handshake blobs)
+            // 0x07 = SECBUFFER_STREAM (entire record including headers)
+            // Accept DATA and STREAM (stream wraps data in place)
+            if (bufType !== 0x01 && bufType !== 0x07) continue;
+            if (cbBuffer === 0 || cbBuffer > 0x100000) continue;
+
+            const data = readMemory(pvBuffer, cbBuffer);
+            if (!data) continue;
+
+            const kind = (direction === 'out')
+                ? 'outgoing_schannel_plain'
+                : 'incoming_schannel_plain';
+
+            emitEvent(kind, {
+                api: api,
+                length: cbBuffer,
+                hex: bytesToHex(data),
+                ascii: u8ToStr(data)
+            });
+        }
+    } catch (e) {
+        console.log('[!] parseSecBufferDesc error for ' + api + ': ' + e);
+    }
+}
+
+// -----------------------------------------------------------------
+// Windows Schannel hooks
 // -----------------------------------------------------------------
 function hookSchannel() {
     if (Process.platform !== 'windows') return;
 
+    // argPos = which argument index holds the PSecBufferDesc
+    // EncryptMessage(PSecHandle, ULONG, PSecBufferDesc, ULONG)      → arg 2
+    // DecryptMessage(PSecHandle, PSecBufferDesc, ULONG, PULONG)      → arg 1
+    // EncryptMessageAsync(AsyncCtx, ULONG, PSecBufferDesc, ULONG)    → arg 2
+    // DecryptMessageAsync(AsyncCtx, PSecBufferDesc, ULONG)           → arg 1
     const candidates = [
-        { mod: 'secur32.dll', sym: 'EncryptMessage' },
-        { mod: 'secur32.dll', sym: 'DecryptMessage' },
-        { mod: 'schannel.dll', sym: 'EncryptMessage' },
-        { mod: 'schannel.dll', sym: 'DecryptMessage' },
-        { mod: 'sspicli.dll', sym: 'EncryptMessage' },
-        { mod: 'sspicli.dll', sym: 'DecryptMessage' },
+        { mod: 'secur32.dll',  sym: 'EncryptMessage',      argPos: 2, dir: 'out' },
+        { mod: 'secur32.dll',  sym: 'DecryptMessage',      argPos: 1, dir: 'in'  },
+        { mod: 'secur32.dll',  sym: 'EncryptMessageAsync', argPos: 2, dir: 'out' },
+        { mod: 'secur32.dll',  sym: 'DecryptMessageAsync', argPos: 1, dir: 'in'  },
+        { mod: 'schannel.dll', sym: 'EncryptMessage',      argPos: 2, dir: 'out' },
+        { mod: 'schannel.dll', sym: 'DecryptMessage',      argPos: 1, dir: 'in'  },
+        { mod: 'schannel.dll', sym: 'EncryptMessageAsync', argPos: 2, dir: 'out' },
+        { mod: 'schannel.dll', sym: 'DecryptMessageAsync', argPos: 1, dir: 'in'  },
+        { mod: 'sspicli.dll',  sym: 'EncryptMessage',      argPos: 2, dir: 'out' },
+        { mod: 'sspicli.dll',  sym: 'DecryptMessage',      argPos: 1, dir: 'in'  },
     ];
 
     const seenAddrs = new Set();
+    let encCount = 0;
+    let decCount = 0;
 
     for (const c of candidates) {
         const addr = findExport(c.mod, c.sym);
@@ -139,61 +216,32 @@ function hookSchannel() {
 
         try {
             if (isEncrypt) {
+                // Encrypt: DATA buffer holds PLAINTEXT on entry
                 Interceptor.attach(addr, {
                     onEnter(args) {
-                        // EncryptMessage(PSecHandle, ULONG, PSecBufferDesc, ULONG)
+                        if (++encCount <= 5) {
+                            console.log('[*] EncryptMessage called (entry #' + encCount + ') via ' + c.mod + '!' + c.sym);
+                        }
                         try {
-                            const pBuffers = args[2];
-                            const cBuffers = pBuffers.readU32();
-                            const bufArray = pBuffers.add(Process.pointerSize).readPointer();
-                            for (let i = 0; i < cBuffers; i++) {
-                                const entry = bufArray.add(i * 3 * Process.pointerSize);
-                                const cbBuffer = entry.readU32();
-                                const bufType = entry.add(8).readU32();
-                                const pvBuffer = entry.add(16).readPointer();
-                                // 0x01 = SECBUFFER_DATA
-                                if (bufType !== 0x01) continue;
-                                if (cbBuffer === 0 || cbBuffer > 0x100000) continue;
-                                const data = readMemory(pvBuffer, cbBuffer);
-                                if (!data) continue;
-                                emitEvent('outgoing_schannel_plain', {
-                                    api: c.mod + '!' + c.sym,
-                                    length: cbBuffer,
-                                    hex: bytesToHex(data),
-                                    ascii: u8ToStr(data)
-                                });
-                            }
+                            const pBuffers = args[c.argPos];
+                            parseSecBufferDesc(pBuffers, c.mod + '!' + c.sym, 'out');
                         } catch (e) {}
                     }
                 });
             } else {
+                // Decrypt: DATA buffer holds PLAINTEXT on leave (after SEC_E_OK)
                 Interceptor.attach(addr, {
                     onEnter(args) {
-                        this.pBuffers = args[2];
+                        if (++decCount <= 5) {
+                            console.log('[*] DecryptMessage called (entry #' + decCount + ') via ' + c.mod + '!' + c.sym);
+                        }
+                        this.pBuffers = args[c.argPos];
                     },
                     onLeave(retval) {
-                        // SEC_E_OK == 0
+                        // SEC_E_OK == 0. Reject failures.
                         if (retval.toInt32() !== 0) return;
                         try {
-                            const pBuffers = this.pBuffers;
-                            const cBuffers = pBuffers.readU32();
-                            const bufArray = pBuffers.add(Process.pointerSize).readPointer();
-                            for (let i = 0; i < cBuffers; i++) {
-                                const entry = bufArray.add(i * 3 * Process.pointerSize);
-                                const cbBuffer = entry.readU32();
-                                const bufType = entry.add(8).readU32();
-                                const pvBuffer = entry.add(16).readPointer();
-                                if (bufType !== 0x01) continue;
-                                if (cbBuffer === 0 || cbBuffer > 0x100000) continue;
-                                const data = readMemory(pvBuffer, cbBuffer);
-                                if (!data) continue;
-                                emitEvent('incoming_schannel_plain', {
-                                    api: c.mod + '!' + c.sym,
-                                    length: cbBuffer,
-                                    hex: bytesToHex(data),
-                                    ascii: u8ToStr(data)
-                                });
-                            }
+                            parseSecBufferDesc(this.pBuffers, c.mod + '!' + c.sym, 'in');
                         } catch (e) {}
                     }
                 });
@@ -206,7 +254,7 @@ function hookSchannel() {
 }
 
 // -----------------------------------------------------------------
-// libc / ws2_32 — fallback socket-level capture
+// libc / ws2_32 — fallback socket-level capture (heavily filtered on Python side)
 // -----------------------------------------------------------------
 function hookLibc() {
     let libcName;
@@ -301,13 +349,12 @@ function hookLibc() {
 }
 
 // -----------------------------------------------------------------
-// OpenSSL / NSS / TLS (for non-Schannel targets)
+// OpenSSL / NSS (non-Schannel targets)
 // -----------------------------------------------------------------
 function hookOpenSSL() {
     const symbols = [
         'SSL_write', 'SSL_read', 'SSL_write_ex', 'SSL_read_ex',
         'SSL_Write', 'SSL_Read',
-        'EVP_EncryptUpdate', 'EVP_DecryptUpdate'
     ];
     const modules = Process.enumerateModules();
     const targets = [];
@@ -330,8 +377,7 @@ function hookOpenSSL() {
         if (seen.has(key)) continue;
         seen.add(key);
 
-        const isWrite = t.sym.toLowerCase().indexOf('write') !== -1
-                     || t.sym.toLowerCase().indexOf('encrypt') !== -1;
+        const isWrite = t.sym.toLowerCase().indexOf('write') !== -1;
         const isEx = t.sym.endsWith('_ex');
 
         try {
@@ -357,9 +403,7 @@ function hookOpenSSL() {
                 });
             } else {
                 Interceptor.attach(t.addr, {
-                    onEnter(args) {
-                        this.buf = args[1];
-                    },
+                    onEnter(args) { this.buf = args[1]; },
                     onLeave(retval) {
                         const n = retval.toInt32();
                         if (n <= 0 || n > 0x100000) return;
@@ -397,83 +441,7 @@ function hookJava() {
                 return b;
             };
         } catch (e) {}
-
-        try {
-            const OutputStream = Java.use('java.io.OutputStream');
-            OutputStream.write.overload('[B').implementation = function (b) {
-                try {
-                    emitEvent('java_out', {
-                        api: this.getClass().getName() + '.write',
-                        length: b.length,
-                        ascii: Java.array_to_string ? Java.array_to_string(b) : ''
-                    });
-                } catch (e) {}
-                return this.write(b);
-            };
-        } catch (e) {}
     });
-}
-
-// -----------------------------------------------------------------
-// Windows WinHTTP / WinINet
-// -----------------------------------------------------------------
-function hookWindowsHttp() {
-    if (Process.platform !== 'windows') return;
-
-    const mods = ['winhttp.dll', 'wininet.dll'];
-    for (const modName of mods) {
-        if (!getModuleSafe(modName)) continue;
-
-        const syms = modName === 'winhttp.dll'
-            ? ['WinHttpWriteData', 'WinHttpReadData']
-            : ['InternetWriteFile', 'InternetReadFile'];
-
-        for (const sym of syms) {
-            const addr = findExport(modName, sym);
-            if (!addr) continue;
-
-            const isWrite = sym.toLowerCase().includes('write');
-
-            try {
-                if (isWrite) {
-                    Interceptor.attach(addr, {
-                        onEnter(args) {
-                            const buf = args[1];
-                            const len = args[2].toInt32();
-                            if (len <= 0 || len > 0x100000) return;
-                            const data = readMemory(buf, len);
-                            if (!data) return;
-                            emitEvent('outgoing_winhttp', {
-                                api: modName + '!' + sym, length: len,
-                                hex: bytesToHex(data), ascii: u8ToStr(data)
-                            });
-                        }
-                    });
-                } else {
-                    Interceptor.attach(addr, {
-                        onEnter(args) {
-                            this.buf = args[1];
-                            this.lenPtr = args[2];
-                            this.api = sym;
-                        },
-                        onLeave(retval) {
-                            try {
-                                const n = this.lenPtr.readU32();
-                                if (n <= 0 || n > 0x100000) return;
-                                const data = readMemory(this.buf, n);
-                                if (!data) return;
-                                emitEvent('incoming_winhttp', {
-                                    api: modName + '!' + this.api, length: n,
-                                    hex: bytesToHex(data), ascii: u8ToStr(data)
-                                });
-                            } catch (e) {}
-                        }
-                    });
-                }
-                console.log('[*] hooked ' + modName + '!' + sym);
-            } catch (e) {}
-        }
-    }
 }
 
 // -----------------------------------------------------------------
@@ -486,7 +454,6 @@ setImmediate(function () {
     try { hookSchannel(); } catch (e) { console.log('[!] hookSchannel: ' + e); }
     try { hookLibc(); } catch (e) { console.log('[!] hookLibc: ' + e); }
     try { hookOpenSSL(); } catch (e) { console.log('[!] hookOpenSSL: ' + e); }
-    try { hookWindowsHttp(); } catch (e) { console.log('[!] hookWindowsHttp: ' + e); }
     try { hookJava(); } catch (e) { console.log('[!] hookJava: ' + e); }
     console.log('[*] hooks installed');
 });
@@ -498,9 +465,10 @@ setImmediate(function () {
 # ---------------------------------------------------------------------------
 HEX_RE = re.compile(r'^[0-9a-fA-F]+$')
 
-# TLS record type + version prefixes we should silently drop
-TLS_PREFIXES = ('160301', '160303', '160302', '140301', '140303',
-                '170301', '170303', '150303', '150301')
+TLS_PREFIXES = ('160301', '160302', '160303',
+                '140301', '140303',
+                '170301', '170303',
+                '150301', '150303')
 
 
 def looks_like_json(s):
@@ -585,7 +553,6 @@ def try_decrypt_blob(data):
 # ---------------------------------------------------------------------------
 def get_device():
     return frida.get_local_device()
-    # Android over USB:  return frida.get_usb_device(timeout=5)
 
 
 def find_detect_processes(device=None):
@@ -615,8 +582,13 @@ def on_message(message, data):
         if not isinstance(payload, dict):
             print('[raw] ' + str(payload))
             return
-        if payload.get('type') == 'network_event':
+        ptype = payload.get('type')
+        if ptype == 'network_event':
             handle_network_event(payload)
+        elif ptype == 'schannel_debug':
+            print(f"[DEBUG] {payload.get('api')} dir={payload.get('direction')} "
+                  f"buf[{payload.get('index')}] type={payload.get('bufType')} "
+                  f"len={payload.get('cbBuffer')}")
         else:
             print(json.dumps(payload, indent=2))
     elif message.get('type') == 'error':
@@ -637,16 +609,26 @@ def handle_network_event(evt):
     ascii_preview = (data.get('ascii', '') or '')[:400]
     hex_str = data.get('hex', '')
 
-    # Filter out raw socket-level TLS framing noise (encrypted records).
-    # We only want Schannel plaintext events and any non-TLS socket traffic.
-    if kind in ('incoming', 'outgoing'):
-        if hex_str[:6] in TLS_PREFIXES:
+    # Keep-list of events we always want to print
+    keep_kinds = ('outgoing_schannel_plain', 'incoming_schannel_plain',
+                  'outgoing_tls', 'incoming_tls',
+                  'http_response_java', 'java_out',
+                  'outgoing_winhttp', 'incoming_winhttp')
+
+    if kind not in keep_kinds:
+        # Raw socket events — only keep if ASCII is clearly readable text
+        sample = ascii_preview[:64]
+        if len(sample) < 8:
             return
-        if length in (1, 9):  # tiny heartbeat/keepalive packets
+        printable = sum(1 for c in sample if 32 <= ord(c) < 127 or c in ('\t', '\n', '\r'))
+        if printable / len(sample) < 0.85:
+            return
+        # Drop obvious TLS framing
+        if hex_str[:6] in TLS_PREFIXES:
             return
 
     print('\n' + '=' * 78)
-    print(f'[{t}] {kind.upper():<24} {api}  fd={fd}  len={length}')
+    print(f'[{t}] {kind.upper():<26} {api}  fd={fd}  len={length}')
     print('-' * 78)
 
     if ascii_preview:
@@ -665,35 +647,26 @@ def handle_network_event(evt):
         except Exception:
             raw = b''
 
-        if raw:
-            if not is_printable(raw):
-                print('[*] ciphertext (not printable) - attempting decryption...')
-                results = try_decrypt_blob(raw)
-                if results:
-                    for scheme, pt in results:
-                        print(f'[+] DECRYPTED via {scheme}:')
-                        try:
-                            txt = pt.decode('utf-8', errors='replace')
-                        except Exception:
-                            txt = repr(pt)
-                        print('    ' + txt[:2000].replace('\n', '\n    '))
-                        if looks_like_json(txt):
-                            try:
-                                print('    JSON:')
-                                print('    ' + json.dumps(json.loads(txt), indent=2)
-                                      [:2000].replace('\n', '\n    '))
-                            except Exception:
-                                pass
-                else:
-                    print('[*] no decryption succeeded with common schemes')
-            else:
-                text = raw.decode('utf-8', errors='replace')
-                if looks_like_json(text):
+        if raw and not is_printable(raw):
+            print('[*] ciphertext (not printable) - attempting decryption...')
+            results = try_decrypt_blob(raw)
+            if results:
+                for scheme, pt in results:
+                    print(f'[+] DECRYPTED via {scheme}:')
                     try:
-                        print('JSON:')
-                        print(json.dumps(json.loads(text), indent=2)[:4000])
+                        txt = pt.decode('utf-8', errors='replace')
                     except Exception:
-                        pass
+                        txt = repr(pt)
+                    print('    ' + txt[:2000].replace('\n', '\n    '))
+                    if looks_like_json(txt):
+                        try:
+                            print('    JSON:')
+                            print('    ' + json.dumps(json.loads(txt), indent=2)
+                                  [:2000].replace('\n', '\n    '))
+                        except Exception:
+                            pass
+            else:
+                print('[*] no decryption succeeded with common schemes')
 
 
 # ---------------------------------------------------------------------------
