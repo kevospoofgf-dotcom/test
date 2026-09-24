@@ -73,16 +73,15 @@ function getExport(mod, sym) {
     return null;
 }
 
-// Correct SecBufferDesc layout:
-//   +0  ULONG ulVersion    (usually 0)
-//   +4  ULONG cBuffers     (count)
-//   +8  PSecBuffer pBuffers (array of {cbBuffer, BufferType, pvBuffer})
-// SecBuffer on x64 is 16 bytes with padding.
+// Correct SecBufferDesc layout on x64:
+//   +0   ULONG      ulVersion    (usually 0)
+//   +4   ULONG      cBuffers     (buffer count)
+//   +8   PSecBuffer pBuffers     (array pointer)
+// Each SecBuffer is 16 bytes: { ULONG cbBuffer; ULONG BufferType; PVOID pvBuffer; }
 function parseSecBufferDesc(pDesc, api, direction) {
     try {
         if (!pDesc || pDesc.isNull()) return;
-        const ulVersion = pDesc.readU32();
-        const cBuffers  = pDesc.add(4).readU32();
+        const cBuffers = pDesc.add(4).readU32();
         if (cBuffers < 1 || cBuffers > 16) return;
         const bufArray = pDesc.add(8).readPointer();
         if (!bufArray || bufArray.isNull()) return;
@@ -118,11 +117,8 @@ function parseSecBufferDesc(pDesc, api, direction) {
     } catch (e) {}
 }
 
-let encCount = 0, decCount = 0;
-
 function hookSspi() {
-    // EncryptMessage(PCtxtHandle, ULONG, PSecBufferDesc, ULONG)
-    //   → args[2] is the PSecBufferDesc
+    // EncryptMessage(PCtxtHandle, ULONG, PSecBufferDesc, ULONG) → args[2]
     const encAddr = getGlobalExport('EncryptMessage')
                  || getExport('secur32.dll', 'EncryptMessage')
                  || getExport('sspicli.dll', 'EncryptMessage');
@@ -130,8 +126,6 @@ function hookSspi() {
         try {
             Interceptor.attach(encAddr, {
                 onEnter(args) {
-                    encCount++;
-                    // On Encrypt, the DATA buffer holds plaintext here.
                     parseSecBufferDesc(args[2], 'EncryptMessage', 'out');
                 }
             });
@@ -141,8 +135,7 @@ function hookSspi() {
         console.log('[!] EncryptMessage not resolved');
     }
 
-    // DecryptMessage(PCtxtHandle, PSecBufferDesc, ULONG, PULONG)
-    //   → args[1] is the PSecBufferDesc
+    // DecryptMessage(PCtxtHandle, PSecBufferDesc, ULONG, PULONG) → args[1]
     const decAddr = getGlobalExport('DecryptMessage')
                  || getExport('secur32.dll', 'DecryptMessage')
                  || getExport('sspicli.dll', 'DecryptMessage');
@@ -153,9 +146,8 @@ function hookSspi() {
                     this.pDesc = args[1];
                 },
                 onLeave(retval) {
-                    // SEC_E_OK == 0; the plaintext is now in the DATA buffer.
+                    // SEC_E_OK == 0; plaintext is now in the DATA buffer.
                     if (retval.toInt32() !== 0) return;
-                    decCount++;
                     parseSecBufferDesc(this.pDesc, 'DecryptMessage', 'in');
                 }
             });
@@ -208,22 +200,22 @@ def on_message(message, data):
         return
 
     kind = p.get('kind', '')
-    data = p.get('data', {})
+    d = p.get('data', {})
     t = p.get('timestamp', '')
-    api = data.get('api', '?')
-    length = data.get('length', '?')
-    ascii_str = data.get('ascii', '') or ''
+    api = d.get('api', '?')
+    length = d.get('length', '?')
+    ascii_str = d.get('ascii', '') or ''
 
-    # Only print plaintext that looks like HTTP or JSON
-    printable_run = 0
+    # Only print plaintext that has a real run of printable ASCII
     max_run = 0
+    run = 0
     for ch in ascii_str[:256]:
         c = ord(ch)
         if 32 <= c < 127 or c in (9, 10, 13):
-            printable_run += 1
-            if printable_run > max_run: max_run = printable_run
+            run += 1
+            if run > max_run: max_run = run
         else:
-            printable_run = 0
+            run = 0
     if max_run < 16:
         return
 
