@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """
-Capture decrypted TLS traffic from detect-fm-<PIN>.exe.
+Capture detect-fm-<PIN>.exe network traffic AND decrypt the application-layer
+ciphertext fields posted to /auth/api/scanning/v2/record and /detection/rules.
 
-Hooks sspicli/secur32!EncryptMessage and DecryptMessage (system exports only
-— app module is never touched), parses the PSecBufferDesc correctly, and
-logs plaintext HTTP/JSON before encryption and after decryption.
+Hooks:
+  sspicli/secur32!EncryptMessage, DecryptMessage   — outer TLS layer
+  bcrypt!BCryptSecretAgreement                     — ECDH shared secret
+  bcrypt!BCryptImportKey                           — imported symmetric key
 
-Writes to %TEMP%\\debug.log (live) and %TEMP%\\debug.jsonl (structured).
+Writes %TEMP%\\debug.log (readable) and %TEMP%\\debug.jsonl (structured).
+
+Run elevated. Frida 17.x compatible.
 """
 
 import frida
@@ -15,39 +19,49 @@ import time
 import json
 import re
 import os
+import base64
 import tempfile
 import psutil
 
 try:
     from Crypto.Cipher import AES
+    from Crypto.Protocol.KDF import HKDF
+    from Crypto.Hash import SHA256
     HAVE_PYCRYPTO = True
 except ImportError:
     HAVE_PYCRYPTO = False
+    print('[!] pycryptodome not installed — decryption disabled')
+    print('    Install with: python -m pip install pycryptodome')
 
 
-# ---------------------------------------------------------------------------
-# Log file paths — %TEMP%\debug.log on Windows, /tmp/debug.log elsewhere.
-# ---------------------------------------------------------------------------
 _LOG_DIR = tempfile.gettempdir()
 _LOG_TXT = os.path.join(_LOG_DIR, 'debug.log')
 _LOG_JSONL = os.path.join(_LOG_DIR, 'debug.jsonl')
 
-# Truncate at start of each run so the file is clean for the next upload.
 try:
     with open(_LOG_TXT, 'w', encoding='utf-8') as f:
         f.write(f'# detect-fm capture — started {time.strftime("%Y-%m-%d %H:%M:%S")}\n')
     with open(_LOG_JSONL, 'w', encoding='utf-8') as f:
         f.write('')
 except Exception as e:
-    print(f'[!] could not open log files: {e}')
-
+    print(f'[!] log open failed: {e}')
 
 _LOG_TXT_F = open(_LOG_TXT, 'a', encoding='utf-8', errors='replace')
 _LOG_JSONL_F = open(_LOG_JSONL, 'a', encoding='utf-8', errors='replace')
 
 
-def log_write_txt(s):
-    """Append a line to debug.log with a timestamp, flush immediately."""
+# --- runtime state ---
+# Sessions keyed by which handshake produced them.  The /scanning/v2/handshake
+# response is the one whose session_id appears in every /record POST.
+_HANDSHAKE = {
+    # session_id -> {'client_nonce': b64, 'server_nonce': b64}
+}
+# Imported keys as we see them, in order.
+_KEYS = []          # list of {'hex': ..., 'ts': ...}
+_LAST_HANDSHAKE_TS = None
+
+
+def log_txt(s):
     try:
         ts = time.strftime('%H:%M:%S')
         _LOG_TXT_F.write(f'[{ts}] {s}\n')
@@ -56,8 +70,7 @@ def log_write_txt(s):
         pass
 
 
-def log_write_jsonl(obj):
-    """Append a JSON object as one line to debug.jsonl."""
+def log_jsonl(obj):
     try:
         _LOG_JSONL_F.write(json.dumps(obj, ensure_ascii=False) + '\n')
         _LOG_JSONL_F.flush()
@@ -71,20 +84,18 @@ JS = r"""
 function emit(p) { try { send(p); } catch (e) {} }
 function ts() { return new Date().toISOString(); }
 
-function bytesToHex(b) {
+function b2h(b) {
     let s = '';
     for (let i = 0; i < b.length; i++)
         s += ('0' + (b[i] & 0xff).toString(16)).slice(-2);
     return s;
 }
-
 function readMem(ptr, len) {
     try {
         if (!ptr || ptr.isNull() || len <= 0 || len > 0x100000) return null;
         return new Uint8Array(ptr.readByteArray(len));
     } catch (e) { return null; }
 }
-
 function u8ToStr(u8) {
     try {
         let s = '';
@@ -96,11 +107,9 @@ function u8ToStr(u8) {
         return s;
     } catch (e) { return ''; }
 }
-
 function emitEvent(kind, data) {
     emit({ type: 'network_event', kind: kind, timestamp: ts(), data: data });
 }
-
 function getGlobalExport(sym) {
     try {
         if (typeof Module.findGlobalExportByName === 'function')
@@ -109,84 +118,162 @@ function getGlobalExport(sym) {
     try { return Module.findExportByName(null, sym); } catch (e) {}
     return null;
 }
-
 function getExport(mod, sym) {
     try { return Module.getExportByName(mod, sym); } catch (e) {}
     try { return Module.findExportByName(mod, sym); } catch (e) {}
     return null;
 }
 
+// ------------------------------------------------------------------
+// Outer TLS capture (sspicli / secur32 EncryptMessage & DecryptMessage)
+// ------------------------------------------------------------------
 function parseSecBufferDesc(pDesc, api, direction) {
     try {
         if (!pDesc || pDesc.isNull()) return;
-        const ulVersion = pDesc.readU32();
         const cBuffers  = pDesc.add(4).readU32();
         if (cBuffers < 1 || cBuffers > 16) return;
         const bufArray = pDesc.add(8).readPointer();
         if (!bufArray || bufArray.isNull()) return;
-
         const stride = 16;
         for (let i = 0; i < cBuffers; i++) {
             const entry = bufArray.add(i * stride);
-            let cbBuffer = 0, bufType = 0, pvBuffer = null;
+            let cb = 0, type = 0, pv = null;
             try {
-                cbBuffer = entry.readU32();
-                bufType  = entry.add(4).readU32();
-                pvBuffer = entry.add(8).readPointer();
+                cb = entry.readU32();
+                type = entry.add(4).readU32();
+                pv = entry.add(8).readPointer();
             } catch (e) { continue; }
-
-            if (bufType !== 0x01 && bufType !== 0x07) continue;
-            if (cbBuffer === 0 || cbBuffer > 0x100000) continue;
-
-            const data = readMem(pvBuffer, cbBuffer);
+            if (type !== 0x01 && type !== 0x07) continue;
+            if (cb === 0 || cb > 0x100000) continue;
+            const data = readMem(pv, cb);
             if (!data) continue;
-
-            emitEvent(
-                direction === 'out' ? 'outgoing_schannel_plain'
-                                    : 'incoming_schannel_plain',
-                {
-                    api: api,
-                    length: cbBuffer,
-                    hex: bytesToHex(data),
-                    ascii: u8ToStr(data)
-                }
-            );
+            emitEvent(direction === 'out' ? 'outgoing_schannel_plain'
+                                          : 'incoming_schannel_plain', {
+                api: api,
+                length: cb,
+                hex: b2h(data),
+                ascii: u8ToStr(data)
+            });
         }
     } catch (e) {}
 }
-
 function hookSspi() {
-    const encAddr = getGlobalExport('EncryptMessage')
-                 || getExport('secur32.dll', 'EncryptMessage')
-                 || getExport('sspicli.dll', 'EncryptMessage');
-    if (encAddr) {
-        Interceptor.attach(encAddr, {
-            onEnter(args) {
-                parseSecBufferDesc(args[2], 'EncryptMessage', 'out');
-            }
+    const enc = getGlobalExport('EncryptMessage')
+             || getExport('secur32.dll', 'EncryptMessage');
+    if (enc) {
+        Interceptor.attach(enc, {
+            onEnter(args) { parseSecBufferDesc(args[2], 'EncryptMessage', 'out'); }
         });
-        console.log('[*] hooked EncryptMessage @ ' + encAddr);
-    } else {
-        console.log('[!] EncryptMessage not resolved');
+        console.log('[*] hooked EncryptMessage');
     }
-
-    const decAddr = getGlobalExport('DecryptMessage')
-                 || getExport('secur32.dll', 'DecryptMessage')
-                 || getExport('sspicli.dll', 'DecryptMessage');
-    if (decAddr) {
-        Interceptor.attach(decAddr, {
-            onEnter(args) {
-                this.pDesc = args[1];
-            },
-            onLeave(retval) {
-                if (retval.toInt32() !== 0) return;
+    const dec = getGlobalExport('DecryptMessage')
+             || getExport('secur32.dll', 'DecryptMessage');
+    if (dec) {
+        Interceptor.attach(dec, {
+            onEnter(args) { this.pDesc = args[1]; },
+            onLeave(ret) {
+                if (ret.toInt32() !== 0) return;
                 parseSecBufferDesc(this.pDesc, 'DecryptMessage', 'in');
             }
         });
-        console.log('[*] hooked DecryptMessage @ ' + decAddr);
-    } else {
-        console.log('[!] DecryptMessage not resolved');
+        console.log('[*] hooked DecryptMessage');
     }
+}
+
+// ------------------------------------------------------------------
+// ECDH shared secret capture
+// ------------------------------------------------------------------
+function hookEcdh() {
+    // BCryptSecretAgreement(hPrivKey, hPubKey, phSecret, dwFlags)
+    //   — phSecret is a BCRYPT_SECRET_HANDLE (opaque), NOT the raw bytes.
+    //   We capture the handle, then hook BCryptDeriveKey to read the derived
+    //   key material.
+    const agree = getGlobalExport('BCryptSecretAgreement')
+               || getExport('bcrypt.dll', 'BCryptSecretAgreement');
+    if (!agree) { console.log('[!] BCryptSecretAgreement not found'); return; }
+    Interceptor.attach(agree, {
+        onEnter(args) {
+            this.pOut = args[2];    // BCRYPT_SECRET_HANDLE *
+        },
+        onLeave(ret) {
+            if (ret.toInt32() !== 0) return;
+            try {
+                const h = this.pOut.readPointer();
+                if (!h.isNull()) {
+                    emit({ type: 'ecdh_handle', handle: h.toString(), ts: ts() });
+                }
+            } catch (e) {}
+        }
+    });
+    console.log('[*] hooked BCryptSecretAgreement');
+}
+
+// ------------------------------------------------------------------
+// Symmetric key capture — BCryptImportKey
+// ------------------------------------------------------------------
+function hookBcryptImport() {
+    // BCryptImportKey(hAlg, hImportKey, pszBlobType, phKey,
+    //                 pbKeyObject, cbKeyObject, pbInput, cbInput, dwFlags)
+    //   arg 7 = pbInput (key blob), arg 8 = cbInput
+    const imp = getGlobalExport('BCryptImportKey')
+             || getExport('bcrypt.dll', 'BCryptImportKey');
+    if (imp) {
+        Interceptor.attach(imp, {
+            onEnter(args) {
+                let blobPtr = args[7];
+                let cb = args[8].toInt32();
+                if (!blobPtr || blobPtr.isNull() || cb <= 0 || cb > 512) return;
+                const data = readMem(blobPtr, cb);
+                if (!data) return;
+                emit({ type: 'bcrypt_key', hex: b2h(data), len: cb, ts: ts() });
+            }
+        });
+        console.log('[*] hooked BCryptImportKey');
+    }
+    const impEx = getGlobalExport('BCryptImportKeyPair')
+                || getExport('bcrypt.dll', 'BCryptImportKeyPair');
+    if (impEx) {
+        Interceptor.attach(impEx, {
+            onEnter(args) {
+                let blobPtr = args[6];
+                let cb = args[7].toInt32();
+                if (!blobPtr || blobPtr.isNull() || cb <= 0 || cb > 512) return;
+                const data = readMem(blobPtr, cb);
+                if (!data) return;
+                emit({ type: 'bcrypt_keypair', hex: b2h(data), len: cb, ts: ts() });
+            }
+        });
+        console.log('[*] hooked BCryptImportKeyPair');
+    }
+}
+
+// ------------------------------------------------------------------
+// Also hook BCryptDeriveKey — this is where HKDF output shows up as raw key
+// ------------------------------------------------------------------
+function hookBcryptDerive() {
+    const dk = getGlobalExport('BCryptDeriveKey')
+            || getExport('bcrypt.dll', 'BCryptDeriveKey');
+    if (!dk) return;
+    Interceptor.attach(dk, {
+        onEnter(args) {
+            // BCryptDeriveKey(hSharedSecret, pwszKDF, pParameterList,
+            //                 pbDerivedKey, cbDerivedKey, pcbResult, dwFlags)
+            this.pOut = args[3];
+            this.cbOut = args[4].toInt32();
+        },
+        onLeave(ret) {
+            if (ret.toInt32() !== 0) return;
+            try {
+                if (!this.pOut || this.pOut.isNull()) return;
+                if (this.cbOut <= 0 || this.cbOut > 256) return;
+                const data = readMem(this.pOut, this.cbOut);
+                if (!data) return;
+                emit({ type: 'bcrypt_derived', hex: b2h(data),
+                       len: this.cbOut, ts: ts() });
+            } catch (e) {}
+        }
+    });
+    console.log('[*] hooked BCryptDeriveKey');
 }
 
 function waitForModule(name, cb, tries) {
@@ -199,90 +286,199 @@ function waitForModule(name, cb, tries) {
 }
 
 setImmediate(function () {
-    console.log('[*] capture agent v7 loaded (pid=' + Process.id + ')');
+    console.log('[*] capture agent v8 loaded (pid=' + Process.id + ')');
     waitForModule('secur32.dll', function () {
         hookSspi();
-        console.log('[*] hooks installed');
+        waitForModule('bcrypt.dll', function () {
+            hookEcdh();
+            hookBcryptImport();
+            hookBcryptDerive();
+            console.log('[*] hooks installed');
+        });
     });
 });
 """
 
 
-def looks_like_json(s):
-    s = (s or '').strip()
-    if not s or s[0] not in '{[':
-        return False
+# ---------------------------------------------------------------------------
+# Python-side crypto
+# ---------------------------------------------------------------------------
+B64_RE = re.compile(r'^[A-Za-z0-9+/=]+$')
+
+
+def b64d(s):
     try:
-        json.loads(s)
-        return True
+        pad = '=' * (-len(s) % 4)
+        return base64.b64decode(s + pad)
     except Exception:
-        return False
+        return None
 
 
+def try_decrypt_record(ciphertext_b64, keys):
+    """
+    Attempt to decrypt a record's ciphertext with every key we've captured.
+    Tries AES-GCM (12-byte nonce, 16-byte tag) and AES-CBC (16-byte IV prefix)
+    and raw AES-CTR with zero nonce as fallback.
+    Returns list of (scheme, plaintext_bytes).
+    """
+    if not HAVE_PYCRYPTO or not keys:
+        return []
+    ct = b64d(ciphertext_b64)
+    if not ct or len(ct) < 16:
+        return []
+    out = []
+    for k in keys:
+        key_bytes = bytes.fromhex(k)
+        # AES-GCM: nonce is usually 12 bytes, prepended
+        for nonce_len in (12, 16):
+            if len(ct) <= nonce_len + 16:
+                continue
+            nonce = ct[:nonce_len]
+            body  = ct[nonce_len:]
+            try:
+                cipher = AES.new(key_bytes, AES.MODE_GCM, nonce=nonce)
+                pt = cipher.decrypt_and_verify(body[:-16], body[-16:])
+                if pt:
+                    out.append((f'AES-GCM/{nonce_len*8}', pt))
+                    break
+            except Exception:
+                pass
+        # AES-CBC with IV prefix
+        try:
+            iv = ct[:16]
+            body = ct[16:]
+            if len(body) % 16 == 0:
+                cipher = AES.new(key_bytes, AES.MODE_CBC, iv=iv)
+                pt = cipher.decrypt(body)
+                # strip PKCS7
+                pad = pt[-1]
+                if 1 <= pad <= 16 and pt[-pad:] == bytes([pad]) * pad:
+                    pt = pt[:-pad]
+                if pt:
+                    out.append(('AES-CBC', pt))
+        except Exception:
+            pass
+    return out
+
+
+def extract_b64_json_field(ascii_text, field):
+    """
+    Given an HTTP body containing a JSON object, pull the base64 value of
+    `field` without parsing the full JSON (works even when the HTTP chunk
+    framing is partial).
+    """
+    m = re.search(r'"' + re.escape(field) + r'"\s*:\s*"([^"]+)"', ascii_text)
+    if m:
+        return m.group(1)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Message handling
+# ---------------------------------------------------------------------------
 def on_message(message, data):
     if message.get('type') != 'send':
         if message.get('type') == 'error':
             msg = '[frida error] ' + message.get('description', '')
-            print(msg)
-            log_write_txt(msg)
+            print(msg); log_txt(msg)
         return
-
     p = message.get('payload')
     if not isinstance(p, dict):
         return
-    if p.get('type') != 'network_event':
+
+    mtype = p.get('type')
+
+    if mtype == 'bcrypt_key':
+        _KEYS.append(p['hex'])
+        msg = f'[KEY] BCryptImportKey len={p["len"]}  hex={p["hex"][:64]}...'
+        print(msg); log_txt(msg)
+        log_jsonl(p)
+        return
+
+    if mtype == 'bcrypt_derived':
+        _KEYS.append(p['hex'])
+        msg = f'[KEY] BCryptDeriveKey len={p["len"]}  hex={p["hex"][:64]}...'
+        print(msg); log_txt(msg)
+        log_jsonl(p)
+        return
+
+    if mtype == 'ecdh_handle':
+        log_txt(f'[ECDH] secret handle {p.get("handle")}')
+        log_jsonl(p)
+        return
+
+    if mtype != 'network_event':
         return
 
     kind = p.get('kind', '')
-    payload_data = p.get('data', {})
+    pd = p.get('data', {})
     t = p.get('timestamp', '')
-    api = payload_data.get('api', '?')
-    length = payload_data.get('length', '?')
-    ascii_str = payload_data.get('ascii', '') or ''
-    hex_str = payload_data.get('hex', '')
+    api = pd.get('api', '?')
+    length = pd.get('length', '?')
+    ascii_str = pd.get('ascii', '') or ''
+    hex_str = pd.get('hex', '')
 
-    # Filter: only keep events with a readable ASCII run
+    # Log everything to jsonl
+    log_jsonl({'ts': t, 'kind': kind, 'api': api,
+               'length': length, 'ascii': ascii_str, 'hex': hex_str})
+
+    # Only print interesting content
     printable_run = 0
     max_run = 0
-    for ch in ascii_str[:512]:
+    for ch in ascii_str[:1024]:
         c = ord(ch)
         if 32 <= c < 127 or c in (9, 10, 13):
             printable_run += 1
             if printable_run > max_run: max_run = printable_run
         else:
             printable_run = 0
-
-    is_interesting = max_run >= 8
-
-    # Always write to JSONL (even uninteresting — useful for reviewing raw bytes later)
-    log_write_jsonl({
-        'ts': t,
-        'kind': kind,
-        'api': api,
-        'length': length,
-        'ascii': ascii_str,
-        'hex': hex_str,
-    })
-
-    if not is_interesting:
+    if max_run < 8:
         return
 
-    # Console + text log for readable content
+    # Print plaintext as before
     header = f'\n{"=" * 78}\n[{t}] {kind.upper():<26} {api}  len={length}\n{"-" * 78}'
-    print(header)
-    print('ASCII: ' + repr(ascii_str[:600]))
-    log_write_txt(header)
-    log_write_txt('ASCII: ' + repr(ascii_str[:600]))
+    print(header); log_txt(header)
+    print('ASCII: ' + repr(ascii_str[:800]))
+    log_txt('ASCII: ' + repr(ascii_str[:800]))
 
-    if looks_like_json(ascii_str):
-        try:
-            pretty = json.dumps(json.loads(ascii_str), indent=2)[:4000]
-            print('JSON:\n' + pretty)
-            log_write_txt('JSON:\n' + pretty)
-        except Exception:
-            pass
+    # Look for a `ciphertext` field in outgoing records — that's the scan data
+    if kind == 'outgoing_schannel_plain' and '"ciphertext"' in ascii_str:
+        ct_b64 = extract_b64_json_field(ascii_str, 'ciphertext')
+        # Also capture the outer JSON fields for context
+        seq  = extract_b64_json_field(ascii_str, 'seq') or '?'
+        nctr = extract_b64_json_field(ascii_str, 'nctr') or '?'
+        typ  = extract_b64_json_field(ascii_str, 'type') or '?'
+        if ct_b64:
+            log_txt(f'[CIPHERTEXT] seq={seq} nctr={nctr} type={typ} len={len(ct_b64)}')
+            results = try_decrypt_record(ct_b64, _KEYS)
+            if results:
+                for scheme, pt in results:
+                    line = f'[DECRYPTED via {scheme}] seq={seq} nctr={nctr} type={typ}'
+                    print(line); log_txt(line)
+                    try:
+                        txt = pt.decode('utf-8', 'replace')
+                    except Exception:
+                        txt = repr(pt)
+                    print('  ' + txt[:2000].replace('\n', '\n  '))
+                    log_txt('  ' + txt[:2000].replace('\n', '\n  '))
+                    # Try JSON parse and pretty-print
+                    try:
+                        obj = json.loads(txt)
+                        pretty = json.dumps(obj, indent=2)
+                        print('  JSON:')
+                        print('  ' + pretty[:4000].replace('\n', '\n  '))
+                        log_txt('  JSON:')
+                        log_txt('  ' + pretty[:4000].replace('\n', '\n  '))
+                    except Exception:
+                        pass
+            else:
+                log_txt(f'[CIPHERTEXT] no key matched yet '
+                        f'(captured {len(_KEYS)} keys so far)')
 
 
+# ---------------------------------------------------------------------------
+# Process discovery / attach
+# ---------------------------------------------------------------------------
 def find_detect_processes():
     out = []
     for proc in psutil.process_iter(['pid', 'name']):
@@ -297,13 +493,12 @@ def find_detect_processes():
 
 def attach_and_run(pid, name):
     msg = f'\n[+] Attaching to {name} (pid={pid})'
-    print(msg)
-    log_write_txt(msg)
+    print(msg); log_txt(msg)
     try:
         session = frida.attach(pid)
     except Exception as e:
         m = f'[!] attach failed: {e}'
-        print(m); log_write_txt(m)
+        print(m); log_txt(m)
         return None
     script = session.create_script(JS)
     script.on('message', on_message)
@@ -311,28 +506,27 @@ def attach_and_run(pid, name):
         script.load()
     except Exception as e:
         m = f'[!] script.load failed: {e}'
-        print(m); log_write_txt(m)
+        print(m); log_txt(m)
         try: session.detach()
         except Exception: pass
         return None
     m = f'[+] Instrumented pid={pid}'
-    print(m); log_write_txt(m)
+    print(m); log_txt(m)
     return session, script
 
 
 def main():
-    print(f'[*] Writing logs to:')
-    print(f'    text   -> {_LOG_TXT}')
-    print(f'    jsonl  -> {_LOG_JSONL}')
-    log_write_txt(f'[*] text log:  {_LOG_TXT}')
-    log_write_txt(f'[*] jsonl log: {_LOG_JSONL}')
+    print(f'[*] Logs:')
+    print(f'    {_LOG_TXT}')
+    print(f'    {_LOG_JSONL}')
+    log_txt(f'[*] text log: {_LOG_TXT}')
+    log_txt(f'[*] jsonl log: {_LOG_JSONL}')
 
     device = frida.get_local_device()
-    print(f'[*] Using device: {device}')
+    print(f'[*] Device: {device}')
 
-    existing = find_detect_processes()
     sessions = []
-    for e in existing:
+    for e in find_detect_processes():
         r = attach_and_run(e['pid'], e['name'])
         if r:
             sessions.append(r)
@@ -366,12 +560,10 @@ def main():
         try: sess.detach()
         except Exception: pass
 
-    log_write_txt('[*] session ended')
+    log_txt('[*] session ended')
     try:
-        _LOG_TXT_F.close()
-        _LOG_JSONL_F.close()
-    except Exception:
-        pass
+        _LOG_TXT_F.close(); _LOG_JSONL_F.close()
+    except Exception: pass
 
 
 if __name__ == '__main__':
