@@ -1,586 +1,171 @@
 #!/usr/bin/env python3
 """
-Frida script that finds 'detect-fm-<PIN>' processes and captures decrypted
-network traffic via:
-  1. secur32/schannel/sspicli EncryptMessage/DecryptMessage  (sync SSPI)
-  2. ws2_32 send/recv/sendto/recvfrom/WSASend/WSARecv        (socket fallback)
-  3. ntdll NtDeviceIoControlFile with SSPI IOCTLs            (async SSPI)
-  4. Backtrace logger on EncryptMessage (first 20 calls)
-  5. App TLS wrapper probes at frames revealed by the backtrace
+sspicli argument probe for detect-fm-<PIN>.exe.
 
-Run elevated (Administrator). Frida 17.x compatible.
+Attaches to detect-fm, hooks ONLY sspicli!EncryptMessage and
+sspicli!DecryptMessage (system DLL exports — never touches the app's own
+module, so an integrity check of the app's .text will not fire), and for
+each call emits the six raw argument pointers plus the first two DWORDs at
+each one. That's enough to identify which argument is the PSecBufferDesc.
+
+No app-module hooks. No ws2_32. No ntdll. No backtrace. No writes to the
+target's memory beyond Frida's normal trampoline on the two system exports.
 """
 
 import frida
 import sys
-import json
 import time
-import re
-
-try:
-    from Crypto.Cipher import AES, ARC4
-    HAVE_PYCRYPTO = True
-except ImportError:
-    HAVE_PYCRYPTO = False
+import json
+import psutil
 
 
-JS_AGENT = r"""
+JS = r"""
 'use strict';
 
-const seen = new Set();
-
-function ts() { return new Date().toISOString(); }
 function emit(p) { try { send(p); } catch (e) {} }
 
-function bytesToHex(b) {
-    let s = '';
-    for (let i = 0; i < b.length; i++)
-        s += ('0' + (b[i] & 0xff).toString(16)).slice(-2);
-    return s;
+function findExport(mod, sym) {
+    try {
+        if (typeof Module.getExportByName === 'function')
+            return Module.getExportByName(mod, sym);
+    } catch (e) {}
+    try {
+        if (typeof Module.findExportByName === 'function')
+            return Module.findExportByName(mod, sym);
+    } catch (e) {}
+    return null;
 }
 
-function readMemory(ptr, len) {
+// Read up to 8 bytes at a pointer and return as "hi/lo" hint string.
+// Never throws.
+function hint(ptr) {
     try {
-        if (!ptr || ptr.isNull() || len <= 0 || len > 0x100000) return null;
-        return new Uint8Array(ptr.readByteArray(len));
-    } catch (e) { return null; }
+        if (!ptr || ptr.isNull()) return 'null';
+        var a = ptr.readU32();
+        var b = ptr.add(4).readU32();
+        return '0x' + (a >>> 0).toString(16) + '/0x' + (b >>> 0).toString(16);
+    } catch (e) {
+        return '?';
+    }
 }
 
-function u8ToStr(u8) {
+// Read a short ASCII preview if the pointer looks like a C string.
+function preview(ptr) {
     try {
-        let s = '';
-        for (let i = 0; i < u8.length; i++) {
-            const c = u8[i];
-            if (c === 0) break;
-            s += String.fromCharCode(c);
+        if (!ptr || ptr.isNull()) return '';
+        var s = ptr.readCString();
+        if (!s) return '';
+        var out = '';
+        for (var i = 0; i < s.length && i < 80; i++) {
+            var c = s.charCodeAt(i);
+            if (c < 32 || c > 126) break;
+            out += s.charAt(i);
         }
-        return s;
+        return out;
     } catch (e) { return ''; }
 }
 
-function emitEvent(kind, data) {
-    emit({ type: 'network_event', kind: kind, timestamp: ts(), data: data });
-}
+var encCount = 0;
+var decCount = 0;
 
-function findExport(moduleName, symbol) {
-    try {
-        if (typeof Module.getExportByName === 'function') {
-            return moduleName
-                ? Module.getExportByName(moduleName, symbol)
-                : Module.getGlobalExportByName(symbol);
-        }
-    } catch (e) {}
-    try {
-        if (typeof Module.findExportByName === 'function') {
-            return Module.findExportByName(moduleName, symbol);
-        }
-    } catch (e) {}
-    try {
-        if (typeof Module.findGlobalExportByName === 'function') {
-            return Module.findGlobalExportByName(symbol);
-        }
-    } catch (e) {}
-    return null;
-}
-
-function getModuleSafe(name) {
-    try { return Process.getModuleByName(name); } catch (e) { return null; }
-}
-
-// Find the main app module (detect-fm-*.exe) and its base
-function getAppModule() {
-    try {
-        const mods = Process.enumerateModules();
-        for (const m of mods) {
-            if (/^detect-fm/i.test(m.name)) return m;
-        }
-    } catch (e) {}
-    return null;
-}
-
-function looksLikeSecBufferDesc(ptr) {
-    try {
-        if (!ptr || ptr.isNull()) return false;
-        const cb = ptr.readU32();
-        if (cb < 1 || cb > 16) return false;
-        const arr = ptr.add(Process.pointerSize).readPointer();
-        if (!arr || arr.isNull()) return false;
-        const firstCb   = arr.readU32();
-        const firstType = arr.add(4).readU32();
-        if (firstCb > 0x100000) return false;
-        if (firstType > 0x20) return false;
-        return true;
-    } catch (e) { return false; }
-}
-
-function parseSecBufferDesc(pBuffers, api, direction) {
-    try {
-        if (!pBuffers || pBuffers.isNull()) return;
-        const cBuffers = pBuffers.readU32();
-        if (cBuffers <= 0 || cBuffers > 16) return;
-        const bufArray = pBuffers.add(Process.pointerSize).readPointer();
-        if (!bufArray || bufArray.isNull()) return;
-
-        const stride = 16;
-        for (let i = 0; i < cBuffers; i++) {
-            const entry = bufArray.add(i * stride);
-            let cbBuffer = 0, bufType = 0, pvBuffer = null;
-            try {
-                cbBuffer = entry.readU32();
-                bufType  = entry.add(4).readU32();
-                pvBuffer = entry.add(8).readPointer();
-            } catch (e) { continue; }
-
-            if (bufType !== 0x01 && bufType !== 0x07) continue;
-            if (cbBuffer === 0 || cbBuffer > 0x100000) continue;
-
-            const data = readMemory(pvBuffer, cbBuffer);
-            if (!data) continue;
-
-            emitEvent(
-                direction === 'out' ? 'outgoing_schannel_plain'
-                                    : 'incoming_schannel_plain',
-                {
-                    api: api,
-                    length: cbBuffer,
-                    hex: bytesToHex(data),
-                    ascii: u8ToStr(data)
-                }
-            );
-        }
-    } catch (e) {}
-}
-
-// -----------------------------------------------------------------
-// Layer 1: sync SSPI + backtrace logger
-// -----------------------------------------------------------------
-function hookSchannel() {
-    if (Process.platform !== 'windows') return;
-
-    const candidates = [
-        { mod: 'secur32.dll',  sym: 'EncryptMessage', dir: 'out' },
-        { mod: 'secur32.dll',  sym: 'DecryptMessage', dir: 'in'  },
-        { mod: 'schannel.dll', sym: 'EncryptMessage', dir: 'out' },
-        { mod: 'schannel.dll', sym: 'DecryptMessage', dir: 'in'  },
-        { mod: 'sspicli.dll',  sym: 'EncryptMessage', dir: 'out' },
-        { mod: 'sspicli.dll',  sym: 'DecryptMessage', dir: 'in'  },
-    ];
-
-    const seenAddrs = new Set();
-    let btBudget = 20;
-
-    for (const c of candidates) {
-        const addr = findExport(c.mod, c.sym);
-        if (!addr) continue;
-        const key = addr.toString();
-        if (seenAddrs.has(key)) continue;
-        seenAddrs.add(key);
-
-        try {
-            Interceptor.attach(addr, {
-                onEnter(args) {
-                    if (c.sym === 'EncryptMessage' && btBudget > 0) {
-                        btBudget--;
-                        try {
-                            const bt = Thread.backtrace(this.context, Backtracer.ACCURATE);
-                            const frames = [];
-                            for (let j = 0; j < Math.min(bt.length, 12); j++) {
-                                try {
-                                    const sym = DebugSymbol.fromAddress(bt[j]);
-                                    frames.push('#' + j + ' ' + sym);
-                                } catch (e) {
-                                    frames.push('#' + j + ' ' + bt[j]);
-                                }
-                            }
-                            emit({ type: 'backtrace',
-                                   where: c.mod + '!' + c.sym,
-                                   frames: frames });
-                        } catch (e) {}
-                    }
-
-                    this.pBuffers = null;
-                    for (let i = 0; i < 6; i++) {
-                        if (looksLikeSecBufferDesc(args[i])) {
-                            this.pBuffers = args[i];
-                            break;
-                        }
-                    }
-                },
-                onLeave(retval) {
-                    if (!this.pBuffers) return;
-                    if (retval.toInt32() !== 0) return;
-                    parseSecBufferDesc(this.pBuffers, c.mod + '!' + c.sym, c.dir);
-                }
-            });
-            console.log('[*] hooked ' + c.mod + '!' + c.sym);
-        } catch (e) {
-            console.log('[!] hook ' + c.mod + '!' + c.sym + ' failed: ' + e);
-        }
+function hookProbe(modName, symName, kind) {
+    var addr = findExport(modName, symName);
+    if (!addr) {
+        console.log('[!] ' + modName + '!' + symName + ' not found');
+        return false;
     }
-}
-
-// -----------------------------------------------------------------
-// Layer 2: ws2_32 socket fallback
-// -----------------------------------------------------------------
-function hookLibc() {
-    if (Process.platform !== 'windows') return;
-    const mod = 'ws2_32.dll';
-    if (!getModuleSafe(mod)) {
-        console.log('[!] ws2_32.dll not loaded');
-        return;
-    }
-
-    const funcs = [
-        ['send',     'out'], ['sendto',   'out'], ['WSASend', 'out'],
-        ['recv',     'in'],  ['recvfrom', 'in'],  ['WSARecv', 'in'],
-    ];
-
-    for (const [name, dir] of funcs) {
-        const addr = findExport(mod, name);
-        if (!addr) continue;
-        try {
-            if (dir === 'out') {
-                Interceptor.attach(addr, {
-                    onEnter(args) {
-                        let buf, len;
-                        if (name === 'WSASend') {
-                            try {
-                                const wsabuf = args[1];
-                                len = wsabuf.readU32();
-                                buf = wsabuf.add(Process.pointerSize).readPointer();
-                            } catch (e) { return; }
-                        } else {
-                            buf = args[1];
-                            len = args[2].toInt32();
-                        }
-                        if (len <= 0 || len > 0x100000) return;
-                        const data = readMemory(buf, len);
-                        if (!data) return;
-                        emitEvent('outgoing', {
-                            api: name, length: len,
-                            hex: bytesToHex(data), ascii: u8ToStr(data)
-                        });
-                    }
-                });
-            } else {
-                Interceptor.attach(addr, {
-                    onEnter(args) {
-                        this.fd = args[0].toInt32();
-                        this.buf = args[1];
-                        this.api = name;
-                    },
-                    onLeave(retval) {
-                        const n = retval.toInt32();
-                        if (n <= 0 || n > 0x100000) return;
-                        let data = null;
-                        if (this.api === 'WSARecv') {
-                            try {
-                                const wsabuf = this.buf;
-                                const realLen = wsabuf.readU32();
-                                const realBuf = wsabuf.add(Process.pointerSize).readPointer();
-                                data = readMemory(realBuf, realLen);
-                            } catch (e) {}
-                        } else {
-                            data = readMemory(this.buf, n);
-                        }
-                        if (!data) return;
-                        emitEvent('incoming', {
-                            api: this.api, fd: this.fd, length: n,
-                            hex: bytesToHex(data), ascii: u8ToStr(data)
-                        });
-                    }
-                });
-            }
-            console.log('[*] hooked ' + mod + '!' + name);
-        } catch (e) {
-            console.log('[!] hook ' + mod + '!' + name + ' failed: ' + e);
-        }
-    }
-}
-
-// -----------------------------------------------------------------
-// Layer 3: NtDeviceIoControlFile
-// -----------------------------------------------------------------
-function hookNtIoControl() {
-    if (Process.platform !== 'windows') return;
-    const addr = findExport('ntdll.dll', 'NtDeviceIoControlFile');
-    if (!addr) return;
-
-    const IOCTL_MAP = {
-        0x39000c: 'SSPI_ENCRYPT',
-        0x390010: 'SSPI_DECRYPT',
-        0x390014: 'SSPI_MAKE_SIGNATURE',
-        0x390018: 'SSPI_VERIFY_SIGNATURE',
-        0x390004: 'SSPI_CONTEXT',
-    };
-
     try {
         Interceptor.attach(addr, {
-            onEnter(args) {
-                try {
-                    const ioctl = args[5].toInt32() & 0xffffff;
-                    const label = IOCTL_MAP[ioctl];
-                    if (!label) return;
+            onEnter: function (args) {
+                var n = (kind === 'enc') ? (++encCount) : (++decCount);
+                // Only log first 10 of each so the terminal stays readable.
+                if (n > 10) return;
 
-                    const inBuf  = args[6];
-                    const inLen  = args[7].toInt32();
-                    const outBuf = args[8];
-                    const outLen = args[9].toInt32();
-
-                    if ((label === 'SSPI_ENCRYPT' || label === 'SSPI_MAKE_SIGNATURE')
-                        && inBuf && !inBuf.isNull() && inLen > 0 && inLen < 0x100000) {
-                        const data = readMemory(inBuf, inLen);
-                        if (data) {
-                            emitEvent('outgoing_schannel_plain', {
-                                api: 'NtDeviceIoControlFile!' + label,
-                                length: inLen,
-                                hex: bytesToHex(data),
-                                ascii: u8ToStr(data)
-                            });
-                        }
-                    }
-                    if ((label === 'SSPI_DECRYPT' || label === 'SSPI_VERIFY_SIGNATURE')
-                        && outBuf && !outBuf.isNull() && outLen > 0 && outLen < 0x100000) {
-                        this.outBuf = outBuf;
-                        this.outLen = outLen;
-                        this.label  = label;
-                    }
-                } catch (e) {}
-            },
-            onLeave(retval) {
-                if (!this.outBuf) return;
-                try {
-                    const data = readMemory(this.outBuf, this.outLen);
-                    if (data) {
-                        emitEvent('incoming_schannel_plain', {
-                            api: 'NtDeviceIoControlFile!' + this.label,
-                            length: this.outLen,
-                            hex: bytesToHex(data),
-                            ascii: u8ToStr(data)
-                        });
-                    }
-                } catch (e) {}
+                var row = {
+                    type: 'args',
+                    kind: kind,
+                    n: n,
+                    where: modName + '!' + symName,
+                    args: [],
+                    hints: [],
+                    previews: []
+                };
+                for (var i = 0; i < 6; i++) {
+                    var p = args[i];
+                    row.args.push(p ? p.toString() : '?');
+                    row.hints.push(hint(p));
+                    row.previews.push(preview(p));
+                }
+                emit(row);
             }
         });
-        console.log('[*] hooked ntdll!NtDeviceIoControlFile');
+        console.log('[*] hooked ' + modName + '!' + symName);
+        return true;
     } catch (e) {
-        console.log('[!] NtDeviceIoControlFile hook failed: ' + e);
+        console.log('[!] hook ' + modName + '!' + symName + ' failed: ' + e);
+        return false;
     }
 }
 
-// -----------------------------------------------------------------
-// Layer 5: App TLS wrapper probes
-// -----------------------------------------------------------------
-// These are the frames that appeared in every EncryptMessage backtrace.
-// Absolute offsets from the module base.
-const APP_PROBE_OFFSETS = [
-    { off: 0x4650f3, name: 'TLS_frame3'  },
-    { off: 0x4505fe, name: 'TLS_frame4a' },
-    { off: 0x45039b, name: 'TLS_frame4b' },
-    { off: 0x45ce85, name: 'TLS_frame2'  },
-];
-
-// Dump ASCII-looking content of up to 4 pointer args, max once per fn per second
-const probeLastSeen = {};
-
-function hookAppTLS() {
-    if (Process.platform !== 'windows') return;
-
-    const appMod = getAppModule();
-    if (!appMod) {
-        console.log('[!] app module not found — skipping app TLS probes');
-        return;
-    }
-    console.log('[*] app module base: ' + appMod.base + ' (' + appMod.name + ')');
-
-    for (const p of APP_PROBE_OFFSETS) {
-        const target = appMod.base.add(p.off);
-        try {
-            Interceptor.attach(target, {
-                onEnter(args) {
-                    const now = Date.now();
-                    if (probeLastSeen[p.name] && now - probeLastSeen[p.name] < 1000) return;
-                    probeLastSeen[p.name] = now;
-
-                    for (let i = 0; i < 4; i++) {
-                        try {
-                            const a = args[i];
-                            if (!a || a.isNull()) continue;
-                            const data = readMemory(a, 512);
-                            if (!data) continue;
-                            const s = u8ToStr(data);
-                            // Count longest run of printable ASCII
-                            let run = 0, best = 0;
-                            for (let k = 0; k < s.length; k++) {
-                                const c = s.charCodeAt(k);
-                                if (c >= 32 && c < 127) { run++; if (run > best) best = run; }
-                                else run = 0;
-                            }
-                            if (best < 16) continue;
-                            emit({
-                                type: 'probe',
-                                fn: p.name,
-                                arg: i,
-                                ptr: a.toString(),
-                                ascii: s.substring(0, 300)
-                            });
-                        } catch (e) {}
-                    }
-                }
-            });
-            console.log('[*] probe hooked ' + p.name + ' @ ' + target);
-        } catch (e) {
-            console.log('[!] probe ' + p.name + ' failed: ' + e);
-        }
-    }
-}
-
-// -----------------------------------------------------------------
-// Entry
-// -----------------------------------------------------------------
 setImmediate(function () {
-    console.log('[*] AGENT VERSION v5 loaded into ' + Process.platform
-                + ' pid ' + Process.id + ' (' + Process.arch + ')');
-    try { hookSchannel();    } catch (e) { console.log('[!] hookSchannel: ' + e); }
-    try { hookLibc();        } catch (e) { console.log('[!] hookLibc: ' + e); }
-    try { hookNtIoControl(); } catch (e) { console.log('[!] hookNtIoControl: ' + e); }
-    try { hookAppTLS();      } catch (e) { console.log('[!] hookAppTLS: ' + e); }
-    console.log('[*] hooks installed');
+    console.log('[*] sspicli arg probe loaded (pid=' + Process.id +
+                ', arch=' + Process.arch + ')');
+    // Prefer sspicli.dll — that is where the real code lives. Fall back to
+    // secur32.dll if for some reason sspicli is not loaded.
+    if (!hookProbe('sspicli.dll', 'EncryptMessage', 'enc')) {
+        hookProbe('secur32.dll', 'EncryptMessage', 'enc');
+    }
+    if (!hookProbe('sspicli.dll', 'DecryptMessage', 'dec')) {
+        hookProbe('secur32.dll', 'DecryptMessage', 'dec');
+    }
+    console.log('[*] probes installed');
 });
 """
 
 
-# ---------------------------------------------------------------------------
-# Python side
-# ---------------------------------------------------------------------------
-HEX_RE = re.compile(r'^[0-9a-fA-F]+$')
-
-TLS_PREFIXES = ('160301', '160302', '160303',
-                '140301', '140303',
-                '170301', '170303',
-                '150301', '150303')
-
-
-def looks_like_json(s):
-    s = (s or '').strip()
-    if not s or s[0] not in '{[':
-        return False
-    try:
-        json.loads(s)
-        return True
-    except Exception:
-        return False
-
-
-def is_printable(b, threshold=0.85):
-    if not b:
-        return False
-    printable = sum(1 for c in b if 32 <= c < 127 or c in (9, 10, 13))
-    return (printable / len(b)) >= threshold
-
-
-def get_device():
-    return frida.get_local_device()
-
-
-def find_detect_processes(device=None):
-    if device is None:
-        device = get_device()
-    matches = []
-    try:
-        for proc in device.enumerate_processes():
-            name = (getattr(proc, 'name', '') or '').lower()
-            if 'detect-fm' in name:
-                matches.append(proc)
-    except Exception as e:
-        print(f'[!] enumerate_processes failed: {e}')
-    return matches
-
-
 def on_message(message, data):
-    if message.get('type') == 'send':
-        payload = message.get('payload')
-        if not isinstance(payload, dict):
-            return
-        ptype = payload.get('type')
-        if ptype == 'network_event':
-            handle_network_event(payload)
-        elif ptype == 'backtrace':
-            print('\n[BACKTRACE] ' + payload.get('where', '?'))
-            for frame in payload.get('frames', []):
-                print('  ' + frame)
-        elif ptype == 'probe':
-            print(f"\n[PROBE] {payload.get('fn')} arg{payload.get('arg')} "
-                  f"ptr={payload.get('ptr')}")
-            print('  ' + repr(payload.get('ascii', '')))
-    elif message.get('type') == 'error':
-        print('[frida error] ' + message.get('description', ''))
+    if message.get('type') != 'send':
+        if message.get('type') == 'error':
+            print('[frida error] ' + message.get('description', ''))
+        return
+    p = message.get('payload')
+    if not isinstance(p, dict):
+        return
+    if p.get('type') == 'args':
+        ts = time.strftime('%H:%M:%S')
+        kind = p.get('kind', '?').upper()
+        print('\n' + '=' * 78)
+        print(f'[{ts}] {kind} #{p.get("n")}  {p.get("where")}')
+        print('-' * 78)
+        for i, a in enumerate(p.get('args', [])):
+            h = p.get('hints', [''] * 6)[i]
+            pv = p.get('previews', [''] * 6)[i]
+            line = f'  arg{i}: ptr={a}  head={h}'
+            if pv:
+                line += f'  str="{pv}"'
+            print(line)
 
 
-def handle_network_event(evt):
-    kind = evt.get('kind', '')
-    data = evt.get('data', {})
-    t = evt.get('timestamp', '')
-    ascii_str = data.get('ascii', '') or ''
-    hex_str = data.get('hex', '')
-    api = data.get('api', '?')
-    length = data.get('length', '?')
-
-    keep_all = ('outgoing_schannel_plain', 'incoming_schannel_plain',
-                'outgoing_winhttp', 'incoming_winhttp')
-
-    if kind not in keep_all:
-        sample = ascii_str[:32]
-        if len(sample) < 4:
-            return
-        printable = sum(1 for c in sample if 32 <= ord(c) < 127)
-        if printable / len(sample) < 0.7:
-            return
-        if hex_str[:6] in TLS_PREFIXES:
-            return
-
-    print('\n' + '=' * 78)
-    print(f'[{t}] {kind.upper():<26} {api}  len={length}')
-    print('-' * 78)
-
-    if ascii_str:
-        print('ASCII: ' + repr(ascii_str[:400]))
-
-    if looks_like_json(ascii_str):
+def find_detect_processes():
+    out = []
+    for proc in psutil.process_iter(['pid', 'name']):
         try:
-            print('JSON:')
-            print(json.dumps(json.loads(ascii_str), indent=2)[:4000])
-        except Exception:
+            name = (proc.info.get('name') or '').lower()
+            if 'detect-fm' in name:
+                out.append(proc.info)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
-
-    if hex_str and HEX_RE.match(hex_str) and HAVE_PYCRYPTO:
-        try:
-            raw = bytes.fromhex(hex_str)
-        except Exception:
-            raw = b''
-        if raw and not is_printable(raw):
-            print('[*] ciphertext detected - attempting common-key decryption...')
-            for k in (b'0123456789abcdef', b'passwordpassword', b'\x00' * 16):
-                try:
-                    c = AES.new(k, AES.MODE_ECB)
-                    pt = c.decrypt(raw[:len(raw) - (len(raw) % 16)])
-                    if is_printable(pt):
-                        print('[+] AES-ECB key=' + k.hex() + ':')
-                        print('    ' + pt.decode('utf-8', 'replace')[:1500])
-                        break
-                except Exception:
-                    pass
+    return out
 
 
-def attach_and_monitor(device, proc, session_holder):
-    print(f'\n[+] Attaching to {proc.name} (pid={proc.pid})')
+def attach_and_run(pid, name):
+    print(f'\n[+] Attaching to {name} (pid={pid})')
     try:
-        session = device.attach(proc.pid)
+        session = frida.attach(pid)
     except Exception as e:
         print(f'[!] attach failed: {e}')
         return None
-
-    script = session.create_script(JS_AGENT)
+    script = session.create_script(JS)
     script.on('message', on_message)
     try:
         script.load()
@@ -589,38 +174,41 @@ def attach_and_monitor(device, proc, session_holder):
         try: session.detach()
         except Exception: pass
         return None
-
-    session_holder.append((proc, session, script))
-    print(f'[+] Instrumented pid={proc.pid}')
-    return session
+    print(f'[+] Instrumented pid={pid}')
+    return session, script
 
 
 def main():
-    print('[*] Acquiring device...')
-    device = get_device()
+    device = frida.get_local_device()
     print(f'[*] Using device: {device}')
 
-    print('[*] Searching for processes matching "detect-fm"...')
-    matches = find_detect_processes(device)
-    for p in matches:
-        print(f'    - {p.name} (pid={p.pid})')
+    existing = find_detect_processes()
+    if existing:
+        print('[*] Found existing processes:')
+        for e in existing:
+            print(f'    - {e["name"]} (pid={e["pid"]})')
 
     sessions = []
-    for p in matches:
-        attach_and_monitor(device, p, sessions)
+    for e in existing:
+        r = attach_and_run(e['pid'], e['name'])
+        if r:
+            sessions.append(r)
 
     if not sessions:
         print('[*] Polling every 2s (Ctrl+C to quit)...')
         known = set()
         try:
             while True:
-                for p in find_detect_processes(device):
-                    if p.pid not in known:
-                        known.add(p.pid)
-                        attach_and_monitor(device, p, sessions)
+                for e in find_detect_processes():
+                    if e['pid'] in known:
+                        continue
+                    r = attach_and_run(e['pid'], e['name'])
+                    if r:
+                        known.add(e['pid'])
+                        sessions.append(r)
                 time.sleep(2)
         except KeyboardInterrupt:
-            print('\n[*] Stopping...')
+            pass
     else:
         print('\n[*] Monitoring. Press Ctrl+C to exit.')
         try:
@@ -629,7 +217,7 @@ def main():
         except KeyboardInterrupt:
             pass
 
-    for proc, sess, script in sessions:
+    for sess, script in sessions:
         try: script.unload()
         except Exception: pass
         try: sess.detach()
