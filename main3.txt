@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Test: intercept POST /auth/api/scanning/v2/record and replace the body with
-an empty JSON payload, so we can observe the server's reaction.
+Rewrite request bodies sent to the /auth/api/scanning/* and session-related
+endpoints on detect.ac. Leaves /auth/api/detection/* and
+/auth/security/detection/* untouched (those are the rules-delivery channel).
 
 Run elevated. Attaches to detect-fm-<PIN>.exe.
 """
@@ -16,6 +17,7 @@ JS = r"""
 'use strict';
 
 function emit(p) { try { send(p); } catch (e) {} }
+
 function findExport(mod, sym) {
     try { return Module.getExportByName(mod, sym); } catch (e) {}
     try { return Module.findExportByName(mod, sym); } catch (e) {}
@@ -42,17 +44,60 @@ function u8ToStr(u8) {
     return s;
 }
 
-var TARGET = '/auth/api/scanning/v2/record';
+// Only these prefixes are targets. Detection channel is excluded on purpose.
+var TARGET_PREFIXES = [
+    '/auth/api/scanning/',
+    '/auth/api/style/',
+    '/auth/api/exists/',
+    '/auth/api/server-status'
+];
 
-// Replacement body we will inject in place of the real one.
-var FAKE_BODY = '{"chain_tag":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","ciphertext":"","nctr":0,"seq":0,"session_id":"0000000000000000000000000000000000000000000000000000000000000000","type":0}';
+// Endpoint-specific fake bodies.
+var FAKE_BODIES = [
+    { match: '/auth/api/scanning/v2/record',
+      body: '{"chain_tag":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","ciphertext":"","nctr":0,"seq":0,"session_id":"0000000000000000000000000000000000000000000000000000000000000000","type":0}' },
+    { match: '/auth/api/scanning/v2/finalize',
+      body: '{"chain_tag":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","ciphertext":"","nctr":0,"seq":0,"session_id":"0000000000000000000000000000000000000000000000000000000000000000","type":255}' },
+    { match: '/auth/api/scanning/complete',
+      body: '{"pin":"00000000","results":["stub"]}' },
+    { match: '/auth/api/scanning/ping',
+      body: '' },
+    { match: '/auth/api/scanning/start-scan',
+      body: '{}' },
+    { match: '/auth/api/scanning/v2/handshake',
+      body: '{"build_id":"stub","client_nonce":"AAAAAAAAAAAAAAAAAAAAAA==","client_pubkey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","pin":"00000000","protocol_version":0}' },
+    { match: '/auth/api/style/',
+      body: '' },
+    { match: '/auth/api/exists/',
+      body: '' },
+    { match: '/auth/api/server-status',
+      body: '' }
+];
 
-// Track whether the current plaintext blob we see belongs to the target URL.
-// Because Schannel can split a single request across multiple buffers, we
-// keep a small state machine: once we see the target path in a buffer, the
-// next buffer whose content starts with '{"chain_tag"' is the body.
-var armed = false;
+var armedUntil = 0;
+var currentRequestLine = '';
 var patchedCount = 0;
+
+function pickFake(urlPath, originalLen) {
+    for (var i = 0; i < FAKE_BODIES.length; i++) {
+        if (urlPath.indexOf(FAKE_BODIES[i].match) >= 0) {
+            var body = FAKE_BODIES[i].body;
+            if (body.length > originalLen) {
+                body = body.substring(0, originalLen);
+            } else if (body.length < originalLen) {
+                body = body + ' '.repeat(originalLen - body.length);
+            }
+            return { body: body, match: FAKE_BODIES[i].match };
+        }
+    }
+    return null;
+}
+
+function extractPath(requestLine) {
+    var parts = requestLine.split(' ');
+    if (parts.length < 2) return '';
+    return parts[1];
+}
 
 function parseSecBufferDesc(pDesc) {
     try {
@@ -76,42 +121,69 @@ function parseSecBufferDesc(pDesc) {
             if (!data) continue;
             const ascii = u8ToStr(data);
 
-            // Arm on the request line
-            if (ascii.indexOf('POST ' + TARGET) >= 0 ||
-                ascii.indexOf('POST ' + TARGET) === 0) {
-                armed = true;
-                emit({ type: 'log', m: 'armed on ' + ascii.substring(0, 80) });
-                continue;
-            }
-            if (!armed) continue;
-
-            // The body follows in a separate buffer, starting with '{"chain_tag"'
-            if (ascii.indexOf('{"chain_tag"') === 0 ||
-                ascii.indexOf('{"chain_tag"') >= 0) {
-
-                // Build a replacement with the same total length so we don't
-                // break the caller's accounting. Pad with spaces if our fake
-                // is shorter than the original.
-                var original = ascii;
-                var fake = FAKE_BODY;
-                if (fake.length < original.length) {
-                    fake = fake + ' '.repeat(original.length - fake.length);
+            var armedHere = false;
+            for (var p = 0; p < TARGET_PREFIXES.length; p++) {
+                if (ascii.indexOf('POST ' + TARGET_PREFIXES[p]) >= 0 ||
+                    ascii.indexOf('GET '  + TARGET_PREFIXES[p]) >= 0 ||
+                    ascii.indexOf('PUT '  + TARGET_PREFIXES[p]) >= 0) {
+                    armedHere = true;
+                    break;
                 }
-                fake = fake.substring(0, original.length);
-
-                try {
-                    pv.writeUtf8String(fake);
-                    patchedCount++;
-                    emit({ type: 'patched',
-                           n: patchedCount,
-                           original_len: original.length,
-                           original_head: original.substring(0, 120),
-                           new_head: fake.substring(0, 120) });
-                } catch (e) {
-                    emit({ type: 'error', m: 'write failed: ' + e });
-                }
-                armed = false;
             }
+
+            if (armedHere) {
+                var rlEnd = ascii.indexOf('\r\n');
+                var rl = rlEnd > 0 ? ascii.substring(0, rlEnd) : ascii;
+                currentRequestLine = rl;
+                armedUntil = Date.now() + 5000;
+                emit({ type: 'log', m: 'armed: ' + rl });
+            }
+
+            if (Date.now() > armedUntil) continue;
+
+            var bodyStart = -1;
+            var rlIdx = ascii.indexOf(' HTTP/1.');
+            if (rlIdx >= 0) {
+                var hdrEnd = ascii.indexOf('\r\n\r\n');
+                if (hdrEnd >= 0) bodyStart = hdrEnd + 4;
+            } else {
+                bodyStart = 0;
+            }
+            if (bodyStart < 0 || bodyStart >= ascii.length) continue;
+
+            var bodyAscii = ascii.substring(bodyStart);
+            if (bodyAscii.length === 0) continue;
+            var firstChar = bodyAscii.charAt(0);
+            if (firstChar !== '{' && firstChar !== '[' && firstChar !== '"') continue;
+
+            var urlPath = extractPath(currentRequestLine);
+
+            // If the endpoint expects an empty body (ping, style, exists),
+            // and this buffer contains one, skip. Otherwise nothing to do.
+            var fakeInfo = pickFake(urlPath, bodyAscii.length);
+            if (!fakeInfo) continue;
+            var fake = fakeInfo.body;
+            if (fake.length === 0) continue;
+
+            try {
+                pv.add(bodyStart).writeUtf8String(fake);
+                patchedCount++;
+                emit({
+                    type: 'patched',
+                    n: patchedCount,
+                    url: urlPath,
+                    match: fakeInfo.match,
+                    offset: bodyStart,
+                    size: bodyAscii.length,
+                    kind: bodyAscii.length > 1000 ? 'LARGE' : 'small',
+                    was: bodyAscii.substring(0, 120),
+                    now: fake.substring(0, 120)
+                });
+            } catch (e) {
+                emit({ type: 'error', m: 'write failed: ' + e });
+            }
+
+            armedUntil = 0;
         }
     } catch (e) {}
 }
@@ -122,9 +194,7 @@ function hookSspi() {
              || findExport('sspicli.dll', 'EncryptMessage');
     if (!enc) { console.log('[!] EncryptMessage not found'); return; }
     Interceptor.attach(enc, {
-        onEnter(args) {
-            parseSecBufferDesc(args[2]);
-        }
+        onEnter(args) { parseSecBufferDesc(args[2]); }
     });
     console.log('[*] hooked EncryptMessage @ ' + enc);
 }
@@ -137,7 +207,7 @@ function waitFor(name, cb, tries) {
 }
 
 setImmediate(function () {
-    console.log('[*] record-body rewriter loaded pid=' + Process.id);
+    console.log('[*] scanning body rewriter loaded pid=' + Process.id);
     waitFor('secur32.dll', function () {
         hookSspi();
         console.log('[*] hooks installed');
@@ -155,11 +225,13 @@ def on_message(message, data):
     t = p.get('type')
     ts = time.strftime('%H:%M:%S')
     if t == 'log':
-        print(f'[{ts}] [LOG] {p.get("m")}')
+        print(f'[{ts}] [ARMED] {p.get("m")}')
     elif t == 'patched':
-        print(f'[{ts}] [PATCHED #{p.get("n")}] original {p.get("original_len")} bytes')
-        print(f'         was: {p.get("original_head")}')
-        print(f'         now: {p.get("new_head")}')
+        print(f'\n[{ts}] [PATCHED #{p.get("n")}] '
+              f'{p.get("url")}  ({p.get("kind")}, {p.get("size")}B, offset {p.get("offset")})')
+        print(f'         match : {p.get("match")}')
+        print(f'         was   : {p.get("was")}')
+        print(f'         now   : {p.get("now")}')
     elif t == 'error':
         print(f'[{ts}] [ERROR] {p.get("m")}')
 
