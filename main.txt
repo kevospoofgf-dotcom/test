@@ -1,6 +1,7 @@
 """Block personal-data access via Frida (companion to nefd.py detector).
 
 Fixes applied in this revision:
+  - AutoModeDetect processes excluded from Frida attachment.
   - CrashDump folder (%LOCALAPPDATA%\CrashDumps) blocked from every FS API.
   - USN journal query returns a fabricated healthy USN_JOURNAL_DATA_V0
     (MaximumSize = 512MB) so "Shrunk Below Windows Minimum" stops firing.
@@ -30,6 +31,17 @@ import ctypes
 # =====================================================================
 
 SUBSTR = "detect"
+
+# ---- Process names to never attach to (case-insensitive substring match).
+# Any process whose exe name contains one of these strings is skipped.
+ATTACH_EXCLUDE_SUBSTR = [
+    "autodetecd",       # note: also matches "AutoModeDetect" via substring
+    "autodetec",
+    "automodedetect",
+    "automodedetec",
+    "automodedetct",
+    "automodedetect.exe",
+]
 
 BLOCK_EVENTLOG         = True
 BLOCK_PREFETCH         = True
@@ -116,7 +128,7 @@ REG_BLOCK = [
     "debugger",
     "monitorprocess",
 
-    # ---- CrashDump configuration (both HKLM and HKCU) ----
+    # ---- CrashDump configuration ----
     "windows error reporting\\localdumps",
     "localdumps",
     "crashcontrol",
@@ -140,17 +152,17 @@ REG_BLOCK = [
     "featureusage",
     "windows defender\\scans\\history\\service\\detectionhistory\\resource",
 
-    # ---- SRUM Extensions (data usage) ----
+    # ---- SRUM Extensions ----
     "\\srum\\extensions",
 
-    # ---- RecentDocs (recently opened files) ----
+    # ---- RecentDocs ----
     "\\explorer\\recentdocs",
 
-    # ---- BAM/DAM (Background Activity Moderator) ----
+    # ---- BAM/DAM ----
     "\\bam\\state",
     "\\dam\\state",
 
-    # ---- Amcache (program execution & file metadata) ----
+    # ---- Amcache ----
     "\\appcompat\\programs\\amcache",
 
     # ---- Event log channels ----
@@ -428,14 +440,9 @@ JS = r'''
 
         if (l.indexOf('\\windows defender\\scans\\history') >= 0) return 'defender-history';
 
-        // ---- NEW: CrashDumps folder (LOCALAPPDATA\CrashDumps) ----
-        // Blocks all reads of .dmp files and directory enumeration so the
-        // scanner sees the folder as non-existent / empty, stopping
-        // "Crashed File Not Present" findings.
         if (l.indexOf('\\crashdumps\\') >= 0) return 'crashdump-folder';
         if (l.endsWith('\\crashdumps')) return 'crashdump-folder';
 
-        // ---- Recycle Bin metadata ($I* info files) ----
         if (l.indexOf('$recycle.bin') >= 0) {
             var rbBase = basenameOf(l);
             if (rbBase.indexOf('$i') === 0 || rbBase.indexOf('$r') === 0) {
@@ -443,7 +450,6 @@ JS = r'''
             }
         }
 
-        // ---- Browser history databases ----
         var BROWSER_SUBSTR = [
             '\\google\\chrome\\user data', '\\microsoft\\edge\\user data',
             '\\bravesoftware\\brave-browser\\user data',
@@ -628,7 +634,6 @@ JS = r'''
         if (ctx.indexOf('$recycle.bin') >= 0) {
             if (l.indexOf('$i') === 0 || l.indexOf('$r') === 0) return true;
         }
-        // ---- NEW: hide all files in CrashDumps folder ----
         if (ctx.indexOf('\\crashdumps\\') >= 0 || ctx.endsWith('\\crashdumps')) return true;
         return false;
     }
@@ -733,44 +738,35 @@ JS = r'''
     var FSCTL_QUERY_USN_JOURNAL    = 0x000900F4;
     var FSCTL_READ_FILE_USN_DATA   = 0x000900EB;
     var FSCTL_CREATE_USN_JOURNAL   = 0x000900E7;
-    var USN_JOURNAL_DATA_SIZE = 64;
 
-    // ---- Helper: write fabricated USN_JOURNAL_DATA_V0 ----
-    // Stops "USN Journal Shrunk Below Windows Minimum" by reporting a
-    // healthy 512MB MaximumSize and matching AllocationDelta.
     function fakeUsnJournalData(ptr) {
         try {
-            ptr.add(0).writeU64(0x1000000000000000);   // UsnJournalID
-            ptr.add(8).writeU64(0x1000000);            // FirstUsn
-            ptr.add(16).writeU64(0x2000000);           // NextUsn
-            ptr.add(24).writeU64(0);                   // LowestValidUsn
-            ptr.add(32).writeU64(0x7FFFFFFFFFFFFFFF);  // MaxUsn
-            ptr.add(40).writeU64(0x20000000);          // MaximumSize = 512 MB
-            ptr.add(48).writeU64(0x400000);            // AllocationDelta = 4 MB
+            ptr.add(0).writeU64(0x1000000000000000);
+            ptr.add(8).writeU64(0x1000000);
+            ptr.add(16).writeU64(0x2000000);
+            ptr.add(24).writeU64(0);
+            ptr.add(32).writeU64(0x7FFFFFFFFFFFFFFF);
+            ptr.add(40).writeU64(0x20000000);
+            ptr.add(48).writeU64(0x400000);
             return true;
         } catch (e) { return false; }
     }
 
-    // ---- Helper: write fabricated USN_RECORD_V2 ----
-    // Stops "USN Journal Not Recording File Activity" by reporting a
-    // recent CREATE+CLOSE for a plausible file name.
     function fakeUsnRecord(buf, offset) {
         try {
             var fname = "system.tmp";
             var fnameLenBytes = fname.length * 2;
-            var headerSize = 60;
-            var recLen = headerSize + fnameLenBytes;
-            recLen = (recLen + 7) & ~7;  // 8-byte alignment
+            var recLen = 60 + fnameLenBytes;
+            recLen = (recLen + 7) & ~7;
 
             var rec = buf.add(offset);
             rec.add(0).writeU32(recLen);
-            rec.add(4).writeU16(2);      // MajorVersion
-            rec.add(6).writeU16(0);      // MinorVersion
-            rec.add(8).writeU64(0x1000000000001);   // FileReferenceNumber
-            rec.add(16).writeU64(0x1000000000000);  // ParentFileReferenceNumber
-            rec.add(24).writeU64(0x1F00000);        // Usn
+            rec.add(4).writeU16(2);
+            rec.add(6).writeU16(0);
+            rec.add(8).writeU64(0x1000000000001);
+            rec.add(16).writeU64(0x1000000000000);
+            rec.add(24).writeU64(0x1F00000);
 
-            // FileTime: (unix_ms + 11644473600000) * 10000
             var unixMs = Date.now();
             var ft = (unixMs + 11644473600000) * 10000;
             var ftLo = ft % 4294967296;
@@ -778,10 +774,10 @@ JS = r'''
             rec.add(32).writeU32(ftLo);
             rec.add(36).writeU32(ftHi);
 
-            rec.add(40).writeU32(0x80000100);  // Reason: FILE_CREATE | CLOSE
-            rec.add(44).writeU32(0);           // SourceInfo
-            rec.add(48).writeU32(0);           // SecurityId
-            rec.add(52).writeU32(0x80);        // FileAttributes (NORMAL)
+            rec.add(40).writeU32(0x80000100);
+            rec.add(44).writeU32(0);
+            rec.add(48).writeU32(0);
+            rec.add(52).writeU32(0x80);
             rec.add(56).writeU16(fnameLenBytes);
             rec.add(58).writeU16(60);
 
@@ -824,11 +820,8 @@ JS = r'''
             if (this._usnRead) {
                 try {
                     if (!this._out.isNull() && this._outSz >= 100) {
-                        // Zero the header area only
                         zeroMem(this._out, 8, 8);
-                        // NextUsn at offset 0
                         this._out.add(0).writeU64(0x2000000);
-                        // Fabricated USN_RECORD_V2 at offset 8
                         var recLen = fakeUsnRecord(this._out, 8);
                         if (recLen > 0) {
                             if (this._pRet && !this._pRet.isNull()) this._pRet.writeU32(8 + recLen);
@@ -848,9 +841,6 @@ JS = r'''
             }
         });
 
-        // Hook ReadDirectoryChangesW to fabricate an FS change notification
-        // matching the journal record above, so live-change monitoring sees
-        // activity rather than silence.
         hook('kernel32.dll', 'ReadDirectoryChangesW', function (a) {
             this._buf = a[1];
             this._bufSz = a[2].toInt32();
@@ -858,17 +848,12 @@ JS = r'''
         }, function (r) {
             try {
                 if (!this._buf.isNull() && this._bufSz >= 100 && this._pRet && !this._pRet.isNull()) {
-                    // FILE_NOTIFY_INFORMATION layout:
-                    // 0  NextEntryOffset (4)
-                    // 4  Action (4)
-                    // 8  FileNameLength (4)
-                    // 12 FileName (UTF-16, variable)
                     var fname = "system.tmp";
                     var fnameBytes = fname.length * 2;
                     var entryLen = 12 + fnameBytes;
-                    this._buf.add(0).writeU32(0);           // NextEntryOffset
-                    this._buf.add(4).writeU32(0x00000001);  // Action: FILE_ACTION_ADDED
-                    this._buf.add(8).writeU32(fnameBytes);  // FileNameLength
+                    this._buf.add(0).writeU32(0);
+                    this._buf.add(4).writeU32(0x00000001);
+                    this._buf.add(8).writeU32(fnameBytes);
                     for (var i = 0; i < fname.length; i++) {
                         this._buf.add(12 + i * 2).writeU16(fname.charCodeAt(i));
                     }
@@ -1011,8 +996,6 @@ JS = r'''
             });
         });
 
-        // CrashDump registry spoofing: return a fabricated empty folder
-        // path for LocalDumps/DumpFolder queries.
         hook('advapi32.dll', 'RegQueryValueExW', function (a) {
             var v = null; try { v = ws(a[1]); } catch (e) {}
             var parent = lookupRegPath(a[0]);
@@ -1155,11 +1138,24 @@ def on_msg(m, d):
     else:
         log_line(f"[?] {json.dumps(p)}")
 
+def _is_excluded_process(name):
+    """Return True if this process name should never be attached to."""
+    if not name:
+        return False
+    n = name.lower()
+    for ex in ATTACH_EXCLUDE_SUBSTR:
+        if ex in n:
+            return True
+    return False
+
 def find_existing(substr):
     out = []
     for p in psutil.process_iter(["pid", "name", "status"]):
         try:
-            if substr not in (p.info["name"] or "").lower():
+            name = (p.info["name"] or "")
+            if substr not in name.lower():
+                continue
+            if _is_excluded_process(name):
                 continue
             if p.info["status"] in (psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD):
                 continue
@@ -1205,7 +1201,7 @@ def main():
         time.sleep(1)
 
     pid = first["pid"]
-    log_line(f'[*] Attaching to PID {pid} ...')
+    log_line(f'[*] Attaching to PID {pid} ({first["name"]}) ...')
 
     try:
         session = frida.attach(pid)
