@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """
-Frida script to find 'detect-fm-<PIN>' processes and capture decrypted network
-traffic by hooking Windows Schannel (EncryptMessage/DecryptMessage and async
-variants). Scans argument slots for a valid SecBufferDesc since forwarders
-don't preserve the documented ABI.
+Frida script that finds 'detect-fm-<PIN>' processes and captures decrypted
+network traffic via three layers plus a diagnostic backtrace logger:
+
+  1. secur32/schannel/sspicli EncryptMessage/DecryptMessage  (sync SSPI)
+  2. ws2_32 send/recv/sendto/recvfrom/WSASend/WSARecv        (socket fallback)
+  3. ntdll NtDeviceIoControlFile with SSPI IOCTLs            (async SSPI)
+  4. Backtrace logger on EncryptMessage (first 20 calls only)
+
+Run elevated (Administrator). Frida 17.x compatible.
 """
 
 import frida
@@ -29,7 +34,8 @@ function emit(p) { try { send(p); } catch (e) {} }
 
 function bytesToHex(b) {
     let s = '';
-    for (let i = 0; i < b.length; i++) s += ('0' + (b[i] & 0xff).toString(16)).slice(-2);
+    for (let i = 0; i < b.length; i++)
+        s += ('0' + (b[i] & 0xff).toString(16)).slice(-2);
     return s;
 }
 
@@ -69,6 +75,11 @@ function findExport(moduleName, symbol) {
             return Module.findExportByName(moduleName, symbol);
         }
     } catch (e) {}
+    try {
+        if (typeof Module.findGlobalExportByName === 'function') {
+            return Module.findGlobalExportByName(symbol);
+        }
+    } catch (e) {}
     return null;
 }
 
@@ -76,7 +87,7 @@ function getModuleSafe(name) {
     try { return Process.getModuleByName(name); } catch (e) { return null; }
 }
 
-// Heuristic: does this pointer look like a valid PSecBufferDesc?
+// Heuristic validator for a PSecBufferDesc
 function looksLikeSecBufferDesc(ptr) {
     try {
         if (!ptr || ptr.isNull()) return false;
@@ -100,8 +111,8 @@ function parseSecBufferDesc(pBuffers, api, direction) {
         const bufArray = pBuffers.add(Process.pointerSize).readPointer();
         if (!bufArray || bufArray.isNull()) return;
 
-        // SecBuffer on x64: { ULONG cbBuffer; ULONG BufferType; PVOID pvBuffer; }
-        // With alignment padding that's 16 bytes per entry.
+        // x64 SecBuffer: { ULONG cbBuffer; ULONG BufferType; PVOID pvBuffer; }
+        // with 8-byte alignment → 16 bytes per entry.
         const stride = 16;
 
         for (let i = 0; i < cBuffers; i++) {
@@ -134,23 +145,23 @@ function parseSecBufferDesc(pBuffers, api, direction) {
     } catch (e) {}
 }
 
+// -----------------------------------------------------------------
+// Layer 1: sync SSPI + backtrace logger
+// -----------------------------------------------------------------
 function hookSchannel() {
     if (Process.platform !== 'windows') return;
 
     const candidates = [
-        { mod: 'secur32.dll',  sym: 'EncryptMessage',      dir: 'out' },
-        { mod: 'secur32.dll',  sym: 'DecryptMessage',      dir: 'in'  },
-        { mod: 'secur32.dll',  sym: 'EncryptMessageAsync', dir: 'out' },
-        { mod: 'secur32.dll',  sym: 'DecryptMessageAsync', dir: 'in'  },
-        { mod: 'schannel.dll', sym: 'EncryptMessage',      dir: 'out' },
-        { mod: 'schannel.dll', sym: 'DecryptMessage',      dir: 'in'  },
-        { mod: 'schannel.dll', sym: 'EncryptMessageAsync', dir: 'out' },
-        { mod: 'schannel.dll', sym: 'DecryptMessageAsync', dir: 'in'  },
-        { mod: 'sspicli.dll',  sym: 'EncryptMessage',      dir: 'out' },
-        { mod: 'sspicli.dll',  sym: 'DecryptMessage',      dir: 'in'  },
+        { mod: 'secur32.dll',  sym: 'EncryptMessage', dir: 'out' },
+        { mod: 'secur32.dll',  sym: 'DecryptMessage', dir: 'in'  },
+        { mod: 'schannel.dll', sym: 'EncryptMessage', dir: 'out' },
+        { mod: 'schannel.dll', sym: 'DecryptMessage', dir: 'in'  },
+        { mod: 'sspicli.dll',  sym: 'EncryptMessage', dir: 'out' },
+        { mod: 'sspicli.dll',  sym: 'DecryptMessage', dir: 'in'  },
     ];
 
     const seenAddrs = new Set();
+    let btBudget = 20;   // print at most 20 backtraces total
 
     for (const c of candidates) {
         const addr = findExport(c.mod, c.sym);
@@ -159,75 +170,95 @@ function hookSchannel() {
         if (seenAddrs.has(key)) continue;
         seenAddrs.add(key);
 
-        const isEncrypt = c.dir === 'out';
-
         try {
-            if (isEncrypt) {
-                Interceptor.attach(addr, {
-                    onEnter(args) {
-                        let found = null;
-                        for (let i = 0; i < 4; i++) {
-                            if (looksLikeSecBufferDesc(args[i])) {
-                                found = args[i];
-                                break;
+            Interceptor.attach(addr, {
+                onEnter(args) {
+                    // Backtrace logger — only on EncryptMessage
+                    if (c.sym === 'EncryptMessage' && btBudget > 0) {
+                        btBudget--;
+                        try {
+                            const bt = Thread.backtrace(this.context, Backtracer.ACCURATE);
+                            const frames = [];
+                            for (let j = 0; j < Math.min(bt.length, 12); j++) {
+                                try {
+                                    const sym = DebugSymbol.fromAddress(bt[j]);
+                                    frames.push('#' + j + ' ' + sym);
+                                } catch (e) {
+                                    frames.push('#' + j + ' ' + bt[j]);
+                                }
                             }
+                            emit({
+                                type: 'backtrace',
+                                where: c.mod + '!' + c.sym,
+                                frames: frames
+                            });
+                        } catch (e) {
+                            emit({ type: 'backtrace', where: c.mod + '!' + c.sym,
+                                   frames: ['<backtrace failed: ' + e + '>'] });
                         }
-                        if (!found) return;
-                        parseSecBufferDesc(found, c.mod + '!' + c.sym, 'out');
                     }
-                });
-            } else {
-                Interceptor.attach(addr, {
-                    onEnter(args) {
-                        let found = null;
-                        for (let i = 0; i < 4; i++) {
-                            if (looksLikeSecBufferDesc(args[i])) {
-                                found = args[i];
-                                break;
-                            }
+
+                    this.pBuffers = null;
+                    for (let i = 0; i < 6; i++) {
+                        if (looksLikeSecBufferDesc(args[i])) {
+                            this.pBuffers = args[i];
+                            break;
                         }
-                        this.pBuffers = found;
-                    },
-                    onLeave(retval) {
-                        if (!this.pBuffers) return;
-                        if (retval.toInt32() !== 0) return;  // SEC_E_OK == 0
-                        parseSecBufferDesc(this.pBuffers, c.mod + '!' + c.sym, 'in');
                     }
-                });
-            }
-            console.log('[*] hooked ' + c.mod + '!' + c.sym + ' @ ' + addr);
+                },
+                onLeave(retval) {
+                    if (!this.pBuffers) return;
+                    // SEC_E_OK == 0
+                    if (retval.toInt32() !== 0) return;
+                    parseSecBufferDesc(this.pBuffers, c.mod + '!' + c.sym, c.dir);
+                }
+            });
+            console.log('[*] hooked ' + c.mod + '!' + c.sym);
         } catch (e) {
             console.log('[!] hook ' + c.mod + '!' + c.sym + ' failed: ' + e);
         }
     }
 }
 
-function hookWinHTTP() {
+// -----------------------------------------------------------------
+// Layer 2: ws2_32 socket fallback
+// -----------------------------------------------------------------
+function hookLibc() {
     if (Process.platform !== 'windows') return;
+    const mod = 'ws2_32.dll';
+    if (!getModuleSafe(mod)) {
+        console.log('[!] ws2_32.dll not loaded');
+        return;
+    }
 
-    const syms = [
-        ['winhttp.dll', 'WinHttpWriteData', 'out'],
-        ['winhttp.dll', 'WinHttpReadData',  'in' ],
-        ['wininet.dll', 'InternetWriteFile', 'out'],
-        ['wininet.dll', 'InternetReadFile',  'in' ],
+    const funcs = [
+        ['send',     'out'], ['sendto',   'out'], ['WSASend', 'out'],
+        ['recv',     'in'],  ['recvfrom', 'in'],  ['WSARecv', 'in'],
     ];
 
-    for (const [mod, sym, dir] of syms) {
-        if (!getModuleSafe(mod)) continue;
-        const addr = findExport(mod, sym);
+    for (const [name, dir] of funcs) {
+        const addr = findExport(mod, name);
         if (!addr) continue;
-
         try {
             if (dir === 'out') {
                 Interceptor.attach(addr, {
                     onEnter(args) {
-                        const buf = args[1];
-                        const len = args[2].toInt32();
+                        let buf, len;
+                        if (name === 'WSASend') {
+                            try {
+                                const wsabuf = args[1];
+                                len = wsabuf.readU32();
+                                buf = wsabuf.add(Process.pointerSize).readPointer();
+                            } catch (e) { return; }
+                        } else {
+                            buf = args[1];
+                            len = args[2].toInt32();
+                        }
                         if (len <= 0 || len > 0x100000) return;
                         const data = readMemory(buf, len);
                         if (!data) return;
-                        emitEvent('outgoing_winhttp', {
-                            api: mod + '!' + sym, length: len,
+                        emitEvent('outgoing', {
+                            api: name, length: len,
                             hex: bytesToHex(data), ascii: u8ToStr(data)
                         });
                     }
@@ -235,34 +266,123 @@ function hookWinHTTP() {
             } else {
                 Interceptor.attach(addr, {
                     onEnter(args) {
+                        this.fd = args[0].toInt32();
                         this.buf = args[1];
-                        this.lenPtr = args[2];
-                        this.api = sym;
+                        this.api = name;
                     },
                     onLeave(retval) {
-                        try {
-                            const n = this.lenPtr.readU32();
-                            if (n <= 0 || n > 0x100000) return;
-                            const data = readMemory(this.buf, n);
-                            if (!data) return;
-                            emitEvent('incoming_winhttp', {
-                                api: mod + '!' + this.api, length: n,
-                                hex: bytesToHex(data), ascii: u8ToStr(data)
-                            });
-                        } catch (e) {}
+                        const n = retval.toInt32();
+                        if (n <= 0 || n > 0x100000) return;
+                        let data = null;
+                        if (this.api === 'WSARecv') {
+                            try {
+                                const wsabuf = this.buf;
+                                const realLen = wsabuf.readU32();
+                                const realBuf = wsabuf.add(Process.pointerSize).readPointer();
+                                data = readMemory(realBuf, realLen);
+                            } catch (e) {}
+                        } else {
+                            data = readMemory(this.buf, n);
+                        }
+                        if (!data) return;
+                        emitEvent('incoming', {
+                            api: this.api, fd: this.fd, length: n,
+                            hex: bytesToHex(data), ascii: u8ToStr(data)
+                        });
                     }
                 });
             }
-            console.log('[*] hooked ' + mod + '!' + sym);
-        } catch (e) {}
+            console.log('[*] hooked ' + mod + '!' + name);
+        } catch (e) {
+            console.log('[!] hook ' + mod + '!' + name + ' failed: ' + e);
+        }
     }
 }
 
+// -----------------------------------------------------------------
+// Layer 3: NtDeviceIoControlFile — async SSPI via lsass
+// -----------------------------------------------------------------
+function hookNtIoControl() {
+    if (Process.platform !== 'windows') return;
+    const addr = findExport('ntdll.dll', 'NtDeviceIoControlFile');
+    if (!addr) {
+        console.log('[!] ntdll!NtDeviceIoControlFile not found');
+        return;
+    }
+
+    const IOCTL_MAP = {
+        0x39000c: 'SSPI_ENCRYPT',
+        0x390010: 'SSPI_DECRYPT',
+        0x390014: 'SSPI_MAKE_SIGNATURE',
+        0x390018: 'SSPI_VERIFY_SIGNATURE',
+        0x390004: 'SSPI_CONTEXT',
+    };
+
+    try {
+        Interceptor.attach(addr, {
+            onEnter(args) {
+                try {
+                    const raw = args[5];
+                    const ioctl = raw.toInt32() & 0xffffff;
+                    const label = IOCTL_MAP[ioctl];
+                    if (!label) return;
+
+                    const inBuf  = args[6];
+                    const inLen  = args[7].toInt32();
+                    const outBuf = args[8];
+                    const outLen = args[9].toInt32();
+
+                    if ((label === 'SSPI_ENCRYPT' || label === 'SSPI_MAKE_SIGNATURE')
+                        && inBuf && !inBuf.isNull() && inLen > 0 && inLen < 0x100000) {
+                        const data = readMemory(inBuf, inLen);
+                        if (data) {
+                            emitEvent('outgoing_schannel_plain', {
+                                api: 'NtDeviceIoControlFile!' + label,
+                                length: inLen,
+                                hex: bytesToHex(data),
+                                ascii: u8ToStr(data)
+                            });
+                        }
+                    }
+
+                    if ((label === 'SSPI_DECRYPT' || label === 'SSPI_VERIFY_SIGNATURE')
+                        && outBuf && !outBuf.isNull() && outLen > 0 && outLen < 0x100000) {
+                        this.outBuf = outBuf;
+                        this.outLen = outLen;
+                        this.label  = label;
+                    }
+                } catch (e) {}
+            },
+            onLeave(retval) {
+                if (!this.outBuf) return;
+                try {
+                    const data = readMemory(this.outBuf, this.outLen);
+                    if (data) {
+                        emitEvent('incoming_schannel_plain', {
+                            api: 'NtDeviceIoControlFile!' + this.label,
+                            length: this.outLen,
+                            hex: bytesToHex(data),
+                            ascii: u8ToStr(data)
+                        });
+                    }
+                } catch (e) {}
+            }
+        });
+        console.log('[*] hooked ntdll!NtDeviceIoControlFile');
+    } catch (e) {
+        console.log('[!] NtDeviceIoControlFile hook failed: ' + e);
+    }
+}
+
+// -----------------------------------------------------------------
+// Entry
+// -----------------------------------------------------------------
 setImmediate(function () {
-    console.log('[*] agent loaded into ' + Process.platform
+    console.log('[*] AGENT VERSION v4 loaded into ' + Process.platform
                 + ' pid ' + Process.id + ' (' + Process.arch + ')');
-    try { hookSchannel(); } catch (e) { console.log('[!] hookSchannel: ' + e); }
-    try { hookWinHTTP(); } catch (e) { console.log('[!] hookWinHTTP: ' + e); }
+    try { hookSchannel();    } catch (e) { console.log('[!] hookSchannel: ' + e); }
+    try { hookLibc();        } catch (e) { console.log('[!] hookLibc: ' + e); }
+    try { hookNtIoControl(); } catch (e) { console.log('[!] hookNtIoControl: ' + e); }
     console.log('[*] hooks installed');
 });
 """
@@ -272,8 +392,11 @@ setImmediate(function () {
 # Python side
 # ---------------------------------------------------------------------------
 HEX_RE = re.compile(r'^[0-9a-fA-F]+$')
-TLS_PREFIXES = ('160301', '160302', '160303', '140301', '140303',
-                '170301', '170303', '150301', '150303')
+
+TLS_PREFIXES = ('160301', '160302', '160303',
+                '140301', '140303',
+                '170301', '170303',
+                '150301', '150303')
 
 
 def looks_like_json(s):
@@ -315,8 +438,15 @@ def find_detect_processes(device=None):
 def on_message(message, data):
     if message.get('type') == 'send':
         payload = message.get('payload')
-        if isinstance(payload, dict) and payload.get('type') == 'network_event':
+        if not isinstance(payload, dict):
+            return
+        ptype = payload.get('type')
+        if ptype == 'network_event':
             handle_network_event(payload)
+        elif ptype == 'backtrace':
+            print('\n[BACKTRACE] ' + payload.get('where', '?'))
+            for frame in payload.get('frames', []):
+                print('  ' + frame)
     elif message.get('type') == 'error':
         print('[frida error] ' + message.get('description', ''))
 
@@ -325,23 +455,20 @@ def handle_network_event(evt):
     kind = evt.get('kind', '')
     data = evt.get('data', {})
     t = evt.get('timestamp', '')
-
+    ascii_str = data.get('ascii', '') or ''
+    hex_str = data.get('hex', '')
     api = data.get('api', '?')
     length = data.get('length', '?')
-    ascii_str = data.get('ascii', '') or ''
-    ascii_preview = ascii_str[:400]
-    hex_str = data.get('hex', '')
 
-    keep_kinds = ('outgoing_schannel_plain', 'incoming_schannel_plain',
-                  'outgoing_winhttp', 'incoming_winhttp')
+    keep_all = ('outgoing_schannel_plain', 'incoming_schannel_plain',
+                'outgoing_winhttp', 'incoming_winhttp')
 
-    if kind not in keep_kinds:
-        # Raw socket events — only keep readable text
-        sample = ascii_preview[:64]
-        if len(sample) < 8:
+    if kind not in keep_all:
+        sample = ascii_str[:32]
+        if len(sample) < 4:
             return
-        printable = sum(1 for c in sample if 32 <= ord(c) < 127 or c in ('\t', '\n', '\r'))
-        if printable / len(sample) < 0.85:
+        printable = sum(1 for c in sample if 32 <= ord(c) < 127)
+        if printable / len(sample) < 0.7:
             return
         if hex_str[:6] in TLS_PREFIXES:
             return
@@ -350,8 +477,8 @@ def handle_network_event(evt):
     print(f'[{t}] {kind.upper():<26} {api}  len={length}')
     print('-' * 78)
 
-    if ascii_preview:
-        print('ASCII: ' + repr(ascii_preview))
+    if ascii_str:
+        print('ASCII: ' + repr(ascii_str[:400]))
 
     if looks_like_json(ascii_str):
         try:
@@ -359,6 +486,24 @@ def handle_network_event(evt):
             print(json.dumps(json.loads(ascii_str), indent=2)[:4000])
         except Exception:
             pass
+
+    if hex_str and HEX_RE.match(hex_str) and HAVE_PYCRYPTO:
+        try:
+            raw = bytes.fromhex(hex_str)
+        except Exception:
+            raw = b''
+        if raw and not is_printable(raw):
+            print('[*] ciphertext detected - attempting common-key decryption...')
+            for k in (b'0123456789abcdef', b'passwordpassword', b'\x00' * 16):
+                try:
+                    c = AES.new(k, AES.MODE_ECB)
+                    pt = c.decrypt(raw[:len(raw) - (len(raw) % 16)])
+                    if is_printable(pt):
+                        print('[+] AES-ECB key=' + k.hex() + ':')
+                        print('    ' + pt.decode('utf-8', 'replace')[:1500])
+                        break
+                except Exception:
+                    pass
 
 
 def attach_and_monitor(device, proc, session_holder):
