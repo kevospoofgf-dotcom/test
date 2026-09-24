@@ -1,11 +1,12 @@
 """Block personal-data access via Frida (companion to nefd.py detector).
 
 Fixes applied in this revision:
-  - Comprehensive forensic artifact blocking: SRUM, UserAssist, BAM,
-    Amcache, Prefetch, browser history, RecentDocs, SetupAPI logs,
-    Defender history, and more.
+  - CrashDump folder (%LOCALAPPDATA%\CrashDumps) blocked from every FS API.
+  - USN journal query returns a fabricated healthy USN_JOURNAL_DATA_V0
+    (MaximumSize = 512MB) so "Shrunk Below Windows Minimum" stops firing.
+  - USN read returns a fabricated USN_RECORD_V2 so "Not Recording File
+    Activity" stops firing.
   - Recycle Bin metadata ($I* files) blocked from every filesystem API.
-  - CrashDump folder spoofing: returns a fabricated empty folder path.
   - IFEO paths blocked at registry + event log layers.
   - Elevation artifacts blocked (UAC, UserAssist, AppInfo, FeatureUsage).
   - RegSetValueExW/A discards writes to blocked keys (returns success).
@@ -45,7 +46,6 @@ BLOCK_BROWSER_HISTORY  = True
 BLOCK_TASKS_COM        = True
 BLOCK_WMI              = True
 
-# ---- Exact-basename artifacts hidden from every filesystem API.
 HIDDEN_NAMES = [
     "detect.log",
     "detect-fm.log",
@@ -78,7 +78,6 @@ SENSITIVE_DIRS = [
     "\\windows defender\\scans\\history\\service\\detectionhistory\\file",
 ]
 
-# ---- Comprehensive forensic artifact registry locations ----
 REG_BLOCK = [
     # ---- Existing forensic trails ----
     "taskcache\\tree\\detectrun",
@@ -117,13 +116,14 @@ REG_BLOCK = [
     "debugger",
     "monitorprocess",
 
-    # ---- CrashDump configuration ----
+    # ---- CrashDump configuration (both HKLM and HKCU) ----
     "windows error reporting\\localdumps",
     "localdumps",
     "crashcontrol",
     "minidumpdir",
     "dumpfile",
     "dedicateddumpfile",
+    "\\software\\microsoft\\windows\\windows error reporting",
 
     # ---- Elevation artifacts ----
     "\\windows\\currentversion\\uac",
@@ -140,23 +140,20 @@ REG_BLOCK = [
     "featureusage",
     "windows defender\\scans\\history\\service\\detectionhistory\\resource",
 
-    # ---- NEW: SRUM Extensions (data usage) ----
+    # ---- SRUM Extensions (data usage) ----
     "\\srum\\extensions",
 
-    # ---- NEW: RecentDocs (recently opened files) ----
+    # ---- RecentDocs (recently opened files) ----
     "\\explorer\\recentdocs",
 
-    # ---- NEW: UserAssist (GUI program execution) ----
-    "\\explorer\\userassist",
-
-    # ---- NEW: BAM/DAM (Background Activity Moderator) ----
+    # ---- BAM/DAM (Background Activity Moderator) ----
     "\\bam\\state",
     "\\dam\\state",
 
-    # ---- NEW: Amcache (program execution & file metadata) ----
+    # ---- Amcache (program execution & file metadata) ----
     "\\appcompat\\programs\\amcache",
 
-    # ---- NEW: Event log channels (process creation, etc.) ----
+    # ---- Event log channels ----
     "\\eventlog\\application",
     "\\eventlog\\security",
     "\\eventlog\\system",
@@ -164,29 +161,29 @@ REG_BLOCK = [
     "\\services\\eventlog\\security",
     "\\services\\eventlog\\system",
 
-    # ---- NEW: Defender scan history ----
+    # ---- Defender scan history ----
     "\\windows defender\\scans\\history\\service\\detectionhistory",
     "\\windows defender\\scans\\history\\results",
 
-    # ---- NEW: WMI activity logs ----
+    # ---- WMI activity logs ----
     "\\wbem\\cimom\\logging",
 
-    # ---- NEW: Network profiles (WiFi history) ----
+    # ---- Network profiles ----
     "\\networklist\\profiles",
     "\\networklist\\signatures",
 
-    # ---- NEW: RDP connection history ----
+    # ---- RDP connection history ----
     "\\terminal server client\\default",
     "\\terminal server client\\servers",
 
-    # ---- NEW: Map Network Drive MRU ----
+    # ---- Map Network Drive MRU ----
     "\\explorer\\map network drive mru",
 
-    # ---- NEW: VPN/RAS history ----
+    # ---- VPN/RAS history ----
     "\\services\\rasman\\parameters",
     "\\services\\rasman\\config",
 
-    # ---- NEW: Proxy settings (potential history) ----
+    # ---- Proxy settings ----
     "\\internet settings\\proxyserver",
     "\\internet settings\\proxyenable",
 ]
@@ -417,26 +414,26 @@ JS = r'''
              l.endsWith('.cer') || l.endsWith('.crt')))
             return 'bypass-remnant';
 
-        // ---- Prefetch (program execution) ----
         if (C.prefetch && l.indexOf('\\prefetch\\') >= 0) return 'prefetch';
 
-        // ---- Event log files (.evtx) ----
         if (C.eventlog && l.indexOf('\\winevt\\') >= 0) return 'eventlog-file';
 
-        // ---- SRUM database (data usage) ----
         if (C.datausage && (l.indexOf('\\sru\\') >= 0 || l.indexOf('srudb.dat') >= 0 || l.indexOf('srumpe2scan') >= 0)) return 'datausage-sru';
 
-        // ---- Amcache.hve (program execution, file metadata) ----
         if (l.indexOf('\\appcompat\\programs\\amcache.hve') >= 0) return 'amcache-hive';
 
-        // ---- SetupAPI logs (device/app install) ----
         if (l.indexOf('\\inf\\setupapi.') >= 0 && l.endsWith('.log')) return 'setupapi-log';
 
-        // ---- WMI activity logs ----
         if (l.indexOf('\\wbem\\logs\\') >= 0 || l.indexOf('\\wbem\\cimom\\') >= 0) return 'wmi-log';
 
-        // ---- Windows Defender history ----
         if (l.indexOf('\\windows defender\\scans\\history') >= 0) return 'defender-history';
+
+        // ---- NEW: CrashDumps folder (LOCALAPPDATA\CrashDumps) ----
+        // Blocks all reads of .dmp files and directory enumeration so the
+        // scanner sees the folder as non-existent / empty, stopping
+        // "Crashed File Not Present" findings.
+        if (l.indexOf('\\crashdumps\\') >= 0) return 'crashdump-folder';
+        if (l.endsWith('\\crashdumps')) return 'crashdump-folder';
 
         // ---- Recycle Bin metadata ($I* info files) ----
         if (l.indexOf('$recycle.bin') >= 0) {
@@ -446,7 +443,7 @@ JS = r'''
             }
         }
 
-        // ---- NEW: Browser history databases (Edge, Chrome, etc.) ----
+        // ---- Browser history databases ----
         var BROWSER_SUBSTR = [
             '\\google\\chrome\\user data', '\\microsoft\\edge\\user data',
             '\\bravesoftware\\brave-browser\\user data',
@@ -469,7 +466,6 @@ JS = r'''
             }
         }
 
-        // ---- NEW: Timeline / Activity History ----
         if (l.indexOf('\\connecteddevicesplatform\\') >= 0 && l.endsWith('activitiescache.db')) return 'timeline-activities';
 
         return null;
@@ -632,6 +628,8 @@ JS = r'''
         if (ctx.indexOf('$recycle.bin') >= 0) {
             if (l.indexOf('$i') === 0 || l.indexOf('$r') === 0) return true;
         }
+        // ---- NEW: hide all files in CrashDumps folder ----
+        if (ctx.indexOf('\\crashdumps\\') >= 0 || ctx.endsWith('\\crashdumps')) return true;
         return false;
     }
 
@@ -736,6 +734,64 @@ JS = r'''
     var FSCTL_READ_FILE_USN_DATA   = 0x000900EB;
     var FSCTL_CREATE_USN_JOURNAL   = 0x000900E7;
     var USN_JOURNAL_DATA_SIZE = 64;
+
+    // ---- Helper: write fabricated USN_JOURNAL_DATA_V0 ----
+    // Stops "USN Journal Shrunk Below Windows Minimum" by reporting a
+    // healthy 512MB MaximumSize and matching AllocationDelta.
+    function fakeUsnJournalData(ptr) {
+        try {
+            ptr.add(0).writeU64(0x1000000000000000);   // UsnJournalID
+            ptr.add(8).writeU64(0x1000000);            // FirstUsn
+            ptr.add(16).writeU64(0x2000000);           // NextUsn
+            ptr.add(24).writeU64(0);                   // LowestValidUsn
+            ptr.add(32).writeU64(0x7FFFFFFFFFFFFFFF);  // MaxUsn
+            ptr.add(40).writeU64(0x20000000);          // MaximumSize = 512 MB
+            ptr.add(48).writeU64(0x400000);            // AllocationDelta = 4 MB
+            return true;
+        } catch (e) { return false; }
+    }
+
+    // ---- Helper: write fabricated USN_RECORD_V2 ----
+    // Stops "USN Journal Not Recording File Activity" by reporting a
+    // recent CREATE+CLOSE for a plausible file name.
+    function fakeUsnRecord(buf, offset) {
+        try {
+            var fname = "system.tmp";
+            var fnameLenBytes = fname.length * 2;
+            var headerSize = 60;
+            var recLen = headerSize + fnameLenBytes;
+            recLen = (recLen + 7) & ~7;  // 8-byte alignment
+
+            var rec = buf.add(offset);
+            rec.add(0).writeU32(recLen);
+            rec.add(4).writeU16(2);      // MajorVersion
+            rec.add(6).writeU16(0);      // MinorVersion
+            rec.add(8).writeU64(0x1000000000001);   // FileReferenceNumber
+            rec.add(16).writeU64(0x1000000000000);  // ParentFileReferenceNumber
+            rec.add(24).writeU64(0x1F00000);        // Usn
+
+            // FileTime: (unix_ms + 11644473600000) * 10000
+            var unixMs = Date.now();
+            var ft = (unixMs + 11644473600000) * 10000;
+            var ftLo = ft % 4294967296;
+            var ftHi = Math.floor(ft / 4294967296);
+            rec.add(32).writeU32(ftLo);
+            rec.add(36).writeU32(ftHi);
+
+            rec.add(40).writeU32(0x80000100);  // Reason: FILE_CREATE | CLOSE
+            rec.add(44).writeU32(0);           // SourceInfo
+            rec.add(48).writeU32(0);           // SecurityId
+            rec.add(52).writeU32(0x80);        // FileAttributes (NORMAL)
+            rec.add(56).writeU16(fnameLenBytes);
+            rec.add(58).writeU16(60);
+
+            for (var fi = 0; fi < fname.length; fi++) {
+                rec.add(60 + fi * 2).writeU16(fname.charCodeAt(fi));
+            }
+            return recLen;
+        } catch (e) { return 0; }
+    }
+
     if (C.usn) {
         hook('kernel32.dll', 'DeviceIoControl', function (a) {
             var code = 0; try { code = a[1].toInt32() >>> 0; } catch (e) {}
@@ -751,14 +807,14 @@ JS = r'''
         }, function (r) {
             if (this._usnQuery) {
                 try {
-                    if (!this._out.isNull() && this._outSz > 0) {
-                        var n = Math.min(this._outSz, USN_JOURNAL_DATA_SIZE);
-                        if (n > 0) zeroMem(this._out, n, n);
-                        if (n >= 56) {
-                            this._out.add(40).writeU64(0x1000000);
-                            this._out.add(48).writeU64(0x400000);
+                    if (!this._out.isNull() && this._outSz >= 56) {
+                        zeroMem(this._out, Math.min(this._outSz, 64), Math.min(this._outSz, 64));
+                        if (fakeUsnJournalData(this._out)) {
+                            if (this._pRet && !this._pRet.isNull()) this._pRet.writeU32(56);
+                            r.replace(1);
+                            blocked('DeviceIoControl', 'USN query -> healthy journal (512MB)');
+                            return;
                         }
-                        if (this._pRet && !this._pRet.isNull()) this._pRet.writeU32(n);
                     }
                 } catch (e) {}
                 r.replace(1);
@@ -767,12 +823,21 @@ JS = r'''
             }
             if (this._usnRead) {
                 try {
-                    if (!this._out.isNull() && this._outSz > 0) {
-                        var n2 = Math.min(this._outSz, 8);
-                        if (n2 > 0) zeroMem(this._out, n2, n2);
-                        if (this._pRet && !this._pRet.isNull()) this._pRet.writeU32(n2);
+                    if (!this._out.isNull() && this._outSz >= 100) {
+                        // Zero the header area only
+                        zeroMem(this._out, 8, 8);
+                        // NextUsn at offset 0
+                        this._out.add(0).writeU64(0x2000000);
+                        // Fabricated USN_RECORD_V2 at offset 8
+                        var recLen = fakeUsnRecord(this._out, 8);
+                        if (recLen > 0) {
+                            if (this._pRet && !this._pRet.isNull()) this._pRet.writeU32(8 + recLen);
+                            r.replace(1);
+                            blocked('DeviceIoControl', 'USN read -> fabricated record');
+                            return;
+                        }
                     }
-                } catch (e) {}
+                } catch (e) { send({type:'error', message:'USN read hook: '+e}); }
                 r.replace(1);
                 blocked('DeviceIoControl', 'USN read -> 0 records');
                 return;
@@ -782,9 +847,37 @@ JS = r'''
                 blocked('DeviceIoControl', 'USN create -> ignored');
             }
         });
+
+        // Hook ReadDirectoryChangesW to fabricate an FS change notification
+        // matching the journal record above, so live-change monitoring sees
+        // activity rather than silence.
         hook('kernel32.dll', 'ReadDirectoryChangesW', function (a) {
+            this._buf = a[1];
+            this._bufSz = a[2].toInt32();
             this._pRet = a[5];
         }, function (r) {
+            try {
+                if (!this._buf.isNull() && this._bufSz >= 100 && this._pRet && !this._pRet.isNull()) {
+                    // FILE_NOTIFY_INFORMATION layout:
+                    // 0  NextEntryOffset (4)
+                    // 4  Action (4)
+                    // 8  FileNameLength (4)
+                    // 12 FileName (UTF-16, variable)
+                    var fname = "system.tmp";
+                    var fnameBytes = fname.length * 2;
+                    var entryLen = 12 + fnameBytes;
+                    this._buf.add(0).writeU32(0);           // NextEntryOffset
+                    this._buf.add(4).writeU32(0x00000001);  // Action: FILE_ACTION_ADDED
+                    this._buf.add(8).writeU32(fnameBytes);  // FileNameLength
+                    for (var i = 0; i < fname.length; i++) {
+                        this._buf.add(12 + i * 2).writeU16(fname.charCodeAt(i));
+                    }
+                    this._pRet.writeU32(entryLen);
+                    r.replace(1);
+                    blocked('ReadDirectoryChangesW', 'fabricated FS change');
+                    return;
+                }
+            } catch (e) {}
             try { if (this._pRet && !this._pRet.isNull()) this._pRet.writeU32(0); } catch (e) {}
             r.replace(1);
             blocked('ReadDirectoryChangesW', 'quiet');
@@ -918,6 +1011,8 @@ JS = r'''
             });
         });
 
+        // CrashDump registry spoofing: return a fabricated empty folder
+        // path for LocalDumps/DumpFolder queries.
         hook('advapi32.dll', 'RegQueryValueExW', function (a) {
             var v = null; try { v = ws(a[1]); } catch (e) {}
             var parent = lookupRegPath(a[0]);
