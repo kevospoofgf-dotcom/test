@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Frida script to find 'detect-fm-<PIN>' processes and monitor network traffic.
-Hooks Windows Schannel (EncryptMessage/DecryptMessage + async variants) to
-capture PLAINTEXT before TLS encryption and after TLS decryption.
-Compatible with Frida 17.x on Windows.
+Frida script to find 'detect-fm-<PIN>' processes and capture decrypted network
+traffic by hooking Windows Schannel (EncryptMessage/DecryptMessage and async
+variants). Scans argument slots for a valid SecBufferDesc since forwarders
+don't preserve the documented ABI.
 """
 
 import frida
@@ -11,37 +11,25 @@ import sys
 import json
 import time
 import re
-import base64
 
 try:
     from Crypto.Cipher import AES, ARC4
-    from Crypto.Util.Padding import unpad
     HAVE_PYCRYPTO = True
 except ImportError:
     HAVE_PYCRYPTO = False
-    print("[!] pycryptodome not installed - AES/RC4 decryption disabled")
-    print("    Install with: python -m pip install pycryptodome")
 
 
-# ---------------------------------------------------------------------------
-# Frida agent
-# ---------------------------------------------------------------------------
 JS_AGENT = r"""
 'use strict';
 
 const seen = new Set();
 
 function ts() { return new Date().toISOString(); }
+function emit(p) { try { send(p); } catch (e) {} }
 
-function emit(payload) {
-    try { send(payload); } catch (e) { console.log('[!] send failed: ' + e); }
-}
-
-function bytesToHex(bytes) {
+function bytesToHex(b) {
     let s = '';
-    for (let i = 0; i < bytes.length; i++) {
-        s += ('0' + (bytes[i] & 0xff).toString(16)).slice(-2);
-    }
+    for (let i = 0; i < b.length; i++) s += ('0' + (b[i] & 0xff).toString(16)).slice(-2);
     return s;
 }
 
@@ -68,7 +56,6 @@ function emitEvent(kind, data) {
     emit({ type: 'network_event', kind: kind, timestamp: ts(), data: data });
 }
 
-// Frida 17 removed findExportByName in favor of getExportByName.
 function findExport(moduleName, symbol) {
     try {
         if (typeof Module.getExportByName === 'function') {
@@ -82,11 +69,6 @@ function findExport(moduleName, symbol) {
             return Module.findExportByName(moduleName, symbol);
         }
     } catch (e) {}
-    try {
-        if (typeof Module.findGlobalExportByName === 'function') {
-            return Module.findGlobalExportByName(symbol);
-        }
-    } catch (e) {}
     return null;
 }
 
@@ -94,40 +76,32 @@ function getModuleSafe(name) {
     try { return Process.getModuleByName(name); } catch (e) { return null; }
 }
 
-// -----------------------------------------------------------------
-// Module dump (diagnostic)
-// -----------------------------------------------------------------
-function dumpModules() {
-    const mods = Process.enumerateModules();
-    console.log('=== TLS-RELATED MODULES (' + mods.length + ' total) ===');
-    for (const m of mods) {
-        const n = m.name.toLowerCase();
-        if (n.includes('ssl') || n.includes('tls') || n.includes('crypto')
-            || n.includes('curl') || n.includes('nss') || n.includes('schannel')
-            || n.includes('secur32') || n.includes('sspicli') || n.includes('ncrypt')
-            || n.includes('boring') || n.includes('mbed') || n.includes('wolf')) {
-            console.log('  ' + m.name + ' @ ' + m.base + ' (' + m.size + ' bytes)');
-        }
-    }
+// Heuristic: does this pointer look like a valid PSecBufferDesc?
+function looksLikeSecBufferDesc(ptr) {
+    try {
+        if (!ptr || ptr.isNull()) return false;
+        const cb = ptr.readU32();
+        if (cb < 1 || cb > 16) return false;
+        const arr = ptr.add(Process.pointerSize).readPointer();
+        if (!arr || arr.isNull()) return false;
+        const firstCb   = arr.readU32();
+        const firstType = arr.add(4).readU32();
+        if (firstCb > 0x100000) return false;
+        if (firstType > 0x20) return false;
+        return true;
+    } catch (e) { return false; }
 }
 
-// -----------------------------------------------------------------
-// Schannel SecBufferDesc parser (shared between sync and async hooks)
-// -----------------------------------------------------------------
 function parseSecBufferDesc(pBuffers, api, direction) {
     try {
         if (!pBuffers || pBuffers.isNull()) return;
         const cBuffers = pBuffers.readU32();
-        if (cBuffers <= 0 || cBuffers > 64) {
-            console.log('[!] ' + api + ' suspicious cBuffers=' + cBuffers);
-            return;
-        }
+        if (cBuffers <= 0 || cBuffers > 16) return;
         const bufArray = pBuffers.add(Process.pointerSize).readPointer();
         if (!bufArray || bufArray.isNull()) return;
 
-        // SecBuffer struct on x64: { ULONG cbBuffer; ULONG BufferType; PVOID pvBuffer; }
-        // Total = 4 + 4 + 8 = 16 bytes, but the 8-byte pointer is 8-byte aligned,
-        // so on the wire it's {ULONG, ULONG, PVOID} = 16 bytes.
+        // SecBuffer on x64: { ULONG cbBuffer; ULONG BufferType; PVOID pvBuffer; }
+        // With alignment padding that's 16 bytes per entry.
         const stride = 16;
 
         for (let i = 0; i < cBuffers; i++) {
@@ -137,73 +111,46 @@ function parseSecBufferDesc(pBuffers, api, direction) {
                 cbBuffer = entry.readU32();
                 bufType  = entry.add(4).readU32();
                 pvBuffer = entry.add(8).readPointer();
-            } catch (e) {
-                continue;
-            }
+            } catch (e) { continue; }
 
-            // Diagnostic dump
-            emit({
-                type: 'schannel_debug',
-                api: api,
-                direction: direction,
-                index: i,
-                bufType: '0x' + bufType.toString(16),
-                cbBuffer: cbBuffer
-            });
-
-            // 0x01 = SECBUFFER_DATA (the payload)
-            // 0x05 = SECBUFFER_TOKEN (handshake blobs)
-            // 0x07 = SECBUFFER_STREAM (entire record including headers)
-            // Accept DATA and STREAM (stream wraps data in place)
+            // 0x01 = SECBUFFER_DATA, 0x07 = SECBUFFER_STREAM
             if (bufType !== 0x01 && bufType !== 0x07) continue;
             if (cbBuffer === 0 || cbBuffer > 0x100000) continue;
 
             const data = readMemory(pvBuffer, cbBuffer);
             if (!data) continue;
 
-            const kind = (direction === 'out')
-                ? 'outgoing_schannel_plain'
-                : 'incoming_schannel_plain';
-
-            emitEvent(kind, {
-                api: api,
-                length: cbBuffer,
-                hex: bytesToHex(data),
-                ascii: u8ToStr(data)
-            });
+            emitEvent(
+                direction === 'out' ? 'outgoing_schannel_plain'
+                                    : 'incoming_schannel_plain',
+                {
+                    api: api,
+                    length: cbBuffer,
+                    hex: bytesToHex(data),
+                    ascii: u8ToStr(data)
+                }
+            );
         }
-    } catch (e) {
-        console.log('[!] parseSecBufferDesc error for ' + api + ': ' + e);
-    }
+    } catch (e) {}
 }
 
-// -----------------------------------------------------------------
-// Windows Schannel hooks
-// -----------------------------------------------------------------
 function hookSchannel() {
     if (Process.platform !== 'windows') return;
 
-    // argPos = which argument index holds the PSecBufferDesc
-    // EncryptMessage(PSecHandle, ULONG, PSecBufferDesc, ULONG)      → arg 2
-    // DecryptMessage(PSecHandle, PSecBufferDesc, ULONG, PULONG)      → arg 1
-    // EncryptMessageAsync(AsyncCtx, ULONG, PSecBufferDesc, ULONG)    → arg 2
-    // DecryptMessageAsync(AsyncCtx, PSecBufferDesc, ULONG)           → arg 1
     const candidates = [
-        { mod: 'secur32.dll',  sym: 'EncryptMessage',      argPos: 2, dir: 'out' },
-        { mod: 'secur32.dll',  sym: 'DecryptMessage',      argPos: 1, dir: 'in'  },
-        { mod: 'secur32.dll',  sym: 'EncryptMessageAsync', argPos: 2, dir: 'out' },
-        { mod: 'secur32.dll',  sym: 'DecryptMessageAsync', argPos: 1, dir: 'in'  },
-        { mod: 'schannel.dll', sym: 'EncryptMessage',      argPos: 2, dir: 'out' },
-        { mod: 'schannel.dll', sym: 'DecryptMessage',      argPos: 1, dir: 'in'  },
-        { mod: 'schannel.dll', sym: 'EncryptMessageAsync', argPos: 2, dir: 'out' },
-        { mod: 'schannel.dll', sym: 'DecryptMessageAsync', argPos: 1, dir: 'in'  },
-        { mod: 'sspicli.dll',  sym: 'EncryptMessage',      argPos: 2, dir: 'out' },
-        { mod: 'sspicli.dll',  sym: 'DecryptMessage',      argPos: 1, dir: 'in'  },
+        { mod: 'secur32.dll',  sym: 'EncryptMessage',      dir: 'out' },
+        { mod: 'secur32.dll',  sym: 'DecryptMessage',      dir: 'in'  },
+        { mod: 'secur32.dll',  sym: 'EncryptMessageAsync', dir: 'out' },
+        { mod: 'secur32.dll',  sym: 'DecryptMessageAsync', dir: 'in'  },
+        { mod: 'schannel.dll', sym: 'EncryptMessage',      dir: 'out' },
+        { mod: 'schannel.dll', sym: 'DecryptMessage',      dir: 'in'  },
+        { mod: 'schannel.dll', sym: 'EncryptMessageAsync', dir: 'out' },
+        { mod: 'schannel.dll', sym: 'DecryptMessageAsync', dir: 'in'  },
+        { mod: 'sspicli.dll',  sym: 'EncryptMessage',      dir: 'out' },
+        { mod: 'sspicli.dll',  sym: 'DecryptMessage',      dir: 'in'  },
     ];
 
     const seenAddrs = new Set();
-    let encCount = 0;
-    let decCount = 0;
 
     for (const c of candidates) {
         const addr = findExport(c.mod, c.sym);
@@ -212,102 +159,75 @@ function hookSchannel() {
         if (seenAddrs.has(key)) continue;
         seenAddrs.add(key);
 
-        const isEncrypt = c.sym.indexOf('Encrypt') !== -1;
+        const isEncrypt = c.dir === 'out';
 
         try {
             if (isEncrypt) {
-                // Encrypt: DATA buffer holds PLAINTEXT on entry
                 Interceptor.attach(addr, {
                     onEnter(args) {
-                        if (++encCount <= 5) {
-                            console.log('[*] EncryptMessage called (entry #' + encCount + ') via ' + c.mod + '!' + c.sym);
+                        let found = null;
+                        for (let i = 0; i < 4; i++) {
+                            if (looksLikeSecBufferDesc(args[i])) {
+                                found = args[i];
+                                break;
+                            }
                         }
-                        try {
-                            const pBuffers = args[c.argPos];
-                            parseSecBufferDesc(pBuffers, c.mod + '!' + c.sym, 'out');
-                        } catch (e) {}
+                        if (!found) return;
+                        parseSecBufferDesc(found, c.mod + '!' + c.sym, 'out');
                     }
                 });
             } else {
-                // Decrypt: DATA buffer holds PLAINTEXT on leave (after SEC_E_OK)
                 Interceptor.attach(addr, {
                     onEnter(args) {
-                        if (++decCount <= 5) {
-                            console.log('[*] DecryptMessage called (entry #' + decCount + ') via ' + c.mod + '!' + c.sym);
+                        let found = null;
+                        for (let i = 0; i < 4; i++) {
+                            if (looksLikeSecBufferDesc(args[i])) {
+                                found = args[i];
+                                break;
+                            }
                         }
-                        this.pBuffers = args[c.argPos];
+                        this.pBuffers = found;
                     },
                     onLeave(retval) {
-                        // SEC_E_OK == 0. Reject failures.
-                        if (retval.toInt32() !== 0) return;
-                        try {
-                            parseSecBufferDesc(this.pBuffers, c.mod + '!' + c.sym, 'in');
-                        } catch (e) {}
+                        if (!this.pBuffers) return;
+                        if (retval.toInt32() !== 0) return;  // SEC_E_OK == 0
+                        parseSecBufferDesc(this.pBuffers, c.mod + '!' + c.sym, 'in');
                     }
                 });
             }
             console.log('[*] hooked ' + c.mod + '!' + c.sym + ' @ ' + addr);
         } catch (e) {
-            console.log('[!] failed to hook ' + c.mod + '!' + c.sym + ': ' + e);
+            console.log('[!] hook ' + c.mod + '!' + c.sym + ' failed: ' + e);
         }
     }
 }
 
-// -----------------------------------------------------------------
-// libc / ws2_32 — fallback socket-level capture (heavily filtered on Python side)
-// -----------------------------------------------------------------
-function hookLibc() {
-    let libcName;
-    if (Process.platform === 'windows') libcName = 'ws2_32.dll';
-    else if (Process.platform === 'darwin') libcName = 'libsystem_c.dylib';
-    else libcName = 'libc.so.6';
+function hookWinHTTP() {
+    if (Process.platform !== 'windows') return;
 
-    let libc = getModuleSafe(libcName);
-    if (!libc && Process.platform === 'linux') libc = getModuleSafe('libc.so');
-    if (!libc) {
-        console.log('[!] could not find libc-like module (' + libcName + ')');
-        return;
-    }
+    const syms = [
+        ['winhttp.dll', 'WinHttpWriteData', 'out'],
+        ['winhttp.dll', 'WinHttpReadData',  'in' ],
+        ['wininet.dll', 'InternetWriteFile', 'out'],
+        ['wininet.dll', 'InternetReadFile',  'in' ],
+    ];
 
-    const funcs = Process.platform === 'windows'
-        ? ['send', 'recv', 'sendto', 'recvfrom', 'WSASend', 'WSARecv']
-        : ['send', 'recv', 'sendto', 'recvfrom', 'write', 'read'];
-
-    for (const name of funcs) {
-        let addr = findExport(libcName, name);
-        if (!addr) addr = findExport(null, name);
+    for (const [mod, sym, dir] of syms) {
+        if (!getModuleSafe(mod)) continue;
+        const addr = findExport(mod, sym);
         if (!addr) continue;
 
-        const isSend = (name === 'send' || name === 'sendto'
-                        || name === 'write' || name === 'WSASend');
-
         try {
-            if (isSend) {
+            if (dir === 'out') {
                 Interceptor.attach(addr, {
                     onEnter(args) {
-                        const fd = args[0].toInt32();
-                        if (name === 'WSASend') {
-                            try {
-                                const wsabuf = args[1];
-                                const realLen = wsabuf.readU32();
-                                const realBuf = wsabuf.add(Process.pointerSize).readPointer();
-                                const data = readMemory(realBuf, realLen);
-                                if (data) {
-                                    emitEvent('outgoing', {
-                                        api: name, fd: fd, length: realLen,
-                                        hex: bytesToHex(data), ascii: u8ToStr(data)
-                                    });
-                                }
-                            } catch (e) {}
-                            return;
-                        }
                         const buf = args[1];
                         const len = args[2].toInt32();
                         if (len <= 0 || len > 0x100000) return;
                         const data = readMemory(buf, len);
                         if (!data) return;
-                        emitEvent('outgoing', {
-                            api: name, fd: fd, length: len,
+                        emitEvent('outgoing_winhttp', {
+                            api: mod + '!' + sym, length: len,
                             hex: bytesToHex(data), ascii: u8ToStr(data)
                         });
                     }
@@ -315,160 +235,45 @@ function hookLibc() {
             } else {
                 Interceptor.attach(addr, {
                     onEnter(args) {
-                        this.fd = args[0].toInt32();
-                        this.buf = args[1];
-                        this.api = name;
-                    },
-                    onLeave(retval) {
-                        const n = retval.toInt32();
-                        if (n <= 0 || n > 0x100000) return;
-                        let data = null;
-                        if (this.api === 'WSARecv') {
-                            try {
-                                const wsabuf = this.buf;
-                                const realLen = wsabuf.readU32();
-                                const realBuf = wsabuf.add(Process.pointerSize).readPointer();
-                                data = readMemory(realBuf, realLen);
-                            } catch (e) {}
-                        } else {
-                            data = readMemory(this.buf, n);
-                        }
-                        if (!data) return;
-                        emitEvent('incoming', {
-                            api: this.api, fd: this.fd, length: n,
-                            hex: bytesToHex(data), ascii: u8ToStr(data)
-                        });
-                    }
-                });
-            }
-            console.log('[*] hooked ' + libcName + '!' + name);
-        } catch (e) {
-            console.log('[!] failed to hook ' + name + ': ' + e);
-        }
-    }
-}
-
-// -----------------------------------------------------------------
-// OpenSSL / NSS (non-Schannel targets)
-// -----------------------------------------------------------------
-function hookOpenSSL() {
-    const symbols = [
-        'SSL_write', 'SSL_read', 'SSL_write_ex', 'SSL_read_ex',
-        'SSL_Write', 'SSL_Read',
-    ];
-    const modules = Process.enumerateModules();
-    const targets = [];
-
-    for (const m of modules) {
-        const n = m.name.toLowerCase();
-        if (!(n.includes('ssl') || n.includes('crypto') || n.includes('tls')
-              || n.includes('curl') || n.includes('nspr') || n.includes('nss')
-              || n.includes('boring') || n.includes('mbed') || n.includes('wolf'))) {
-            continue;
-        }
-        for (const sym of symbols) {
-            const a = findExport(m.name, sym);
-            if (a) targets.push({ sym: sym, addr: a, module: m.name });
-        }
-    }
-
-    for (const t of targets) {
-        const key = t.module + '!' + t.sym;
-        if (seen.has(key)) continue;
-        seen.add(key);
-
-        const isWrite = t.sym.toLowerCase().indexOf('write') !== -1;
-        const isEx = t.sym.endsWith('_ex');
-
-        try {
-            if (isEx) {
-                Interceptor.attach(t.addr, {
-                    onEnter(args) {
                         this.buf = args[1];
                         this.lenPtr = args[2];
+                        this.api = sym;
                     },
                     onLeave(retval) {
                         try {
-                            if (retval.toInt32() !== 1) return;
-                            const n = this.lenPtr.readULong();
+                            const n = this.lenPtr.readU32();
                             if (n <= 0 || n > 0x100000) return;
                             const data = readMemory(this.buf, n);
                             if (!data) return;
-                            emitEvent(isWrite ? 'outgoing_tls' : 'incoming_tls', {
-                                api: key, length: n,
+                            emitEvent('incoming_winhttp', {
+                                api: mod + '!' + this.api, length: n,
                                 hex: bytesToHex(data), ascii: u8ToStr(data)
                             });
                         } catch (e) {}
                     }
                 });
-            } else {
-                Interceptor.attach(t.addr, {
-                    onEnter(args) { this.buf = args[1]; },
-                    onLeave(retval) {
-                        const n = retval.toInt32();
-                        if (n <= 0 || n > 0x100000) return;
-                        const data = readMemory(this.buf, n);
-                        if (!data) return;
-                        emitEvent(isWrite ? 'outgoing_tls' : 'incoming_tls', {
-                            api: key, length: n,
-                            hex: bytesToHex(data), ascii: u8ToStr(data)
-                        });
-                    }
-                });
             }
-            console.log('[*] hooked ' + key);
+            console.log('[*] hooked ' + mod + '!' + sym);
         } catch (e) {}
     }
 }
 
-// -----------------------------------------------------------------
-// Java / Android
-// -----------------------------------------------------------------
-function hookJava() {
-    if (typeof Java === 'undefined' || !Java.available) return;
-    Java.perform(function () {
-        try {
-            const ResponseBody = Java.use('okhttp3.ResponseBody');
-            ResponseBody.bytes.implementation = function () {
-                const b = this.bytes();
-                try {
-                    emitEvent('http_response_java', {
-                        api: 'okhttp3.ResponseBody.bytes',
-                        length: b.length,
-                        ascii: Java.array_to_string ? Java.array_to_string(b) : null
-                    });
-                } catch (e) {}
-                return b;
-            };
-        } catch (e) {}
-    });
-}
-
-// -----------------------------------------------------------------
-// Entry
-// -----------------------------------------------------------------
 setImmediate(function () {
-    console.log('[*] detect_monitor loaded into ' + Process.platform
+    console.log('[*] agent loaded into ' + Process.platform
                 + ' pid ' + Process.id + ' (' + Process.arch + ')');
-    try { dumpModules(); } catch (e) { console.log('[!] dumpModules: ' + e); }
     try { hookSchannel(); } catch (e) { console.log('[!] hookSchannel: ' + e); }
-    try { hookLibc(); } catch (e) { console.log('[!] hookLibc: ' + e); }
-    try { hookOpenSSL(); } catch (e) { console.log('[!] hookOpenSSL: ' + e); }
-    try { hookJava(); } catch (e) { console.log('[!] hookJava: ' + e); }
+    try { hookWinHTTP(); } catch (e) { console.log('[!] hookWinHTTP: ' + e); }
     console.log('[*] hooks installed');
 });
 """
 
 
 # ---------------------------------------------------------------------------
-# Decryption helpers
+# Python side
 # ---------------------------------------------------------------------------
 HEX_RE = re.compile(r'^[0-9a-fA-F]+$')
-
-TLS_PREFIXES = ('160301', '160302', '160303',
-                '140301', '140303',
-                '170301', '170303',
-                '150301', '150303')
+TLS_PREFIXES = ('160301', '160302', '160303', '140301', '140303',
+                '170301', '170303', '150301', '150303')
 
 
 def looks_like_json(s):
@@ -489,68 +294,6 @@ def is_printable(b, threshold=0.85):
     return (printable / len(b)) >= threshold
 
 
-def try_decrypt_blob(data):
-    results = []
-    if not HAVE_PYCRYPTO:
-        return results
-
-    common_keys = [
-        b'0123456789abcdef', b'0123456789ABCDEF',
-        b'0000000000000000', b'\x00' * 16,
-        b'1234567890123456', b'passwordpassword',
-    ]
-    iv_zero = b'\x00' * 16
-
-    for k in common_keys:
-        try:
-            c = AES.new(k, AES.MODE_ECB)
-            pt = c.decrypt(data[:len(data) - (len(data) % 16)])
-            try: pt = unpad(pt, 16)
-            except Exception: pass
-            if is_printable(pt):
-                results.append(('AES-ECB key=' + k.hex(), pt))
-        except Exception:
-            pass
-
-        try:
-            c = AES.new(k, AES.MODE_CBC, iv_zero)
-            pt = c.decrypt(data[:len(data) - (len(data) % 16)])
-            try: pt = unpad(pt, 16)
-            except Exception: pass
-            if is_printable(pt):
-                results.append(('AES-CBC zeroIV key=' + k.hex(), pt))
-        except Exception:
-            pass
-
-    for k in [b'key', b'secret', b'password']:
-        try:
-            pt = ARC4.new(k).decrypt(data)
-            if is_printable(pt):
-                results.append(('RC4 key=' + k.hex(), pt))
-        except Exception:
-            pass
-
-    for key in range(1, 256):
-        pt = bytes(b ^ key for b in data[:512])
-        if looks_like_json(pt.decode('utf-8', errors='ignore')):
-            results.append(('XOR key=0x%02x' % key, pt))
-            break
-
-    try:
-        s = data.decode('ascii', errors='ignore')
-        if re.fullmatch(r'[A-Za-z0-9+/=\s]+', s) and len(s) % 4 == 0:
-            dec = base64.b64decode(s)
-            if is_printable(dec):
-                results.append(('Base64', dec))
-    except Exception:
-        pass
-
-    return results
-
-
-# ---------------------------------------------------------------------------
-# Process discovery
-# ---------------------------------------------------------------------------
 def get_device():
     return frida.get_local_device()
 
@@ -558,44 +301,24 @@ def get_device():
 def find_detect_processes(device=None):
     if device is None:
         device = get_device()
-
     matches = []
     try:
-        procs = device.enumerate_processes()
+        for proc in device.enumerate_processes():
+            name = (getattr(proc, 'name', '') or '').lower()
+            if 'detect-fm' in name:
+                matches.append(proc)
     except Exception as e:
         print(f'[!] enumerate_processes failed: {e}')
-        return matches
-
-    for proc in procs:
-        name = (getattr(proc, 'name', '') or '').lower()
-        if 'detect-fm' in name:
-            matches.append(proc)
     return matches
 
 
-# ---------------------------------------------------------------------------
-# Event handling
-# ---------------------------------------------------------------------------
 def on_message(message, data):
     if message.get('type') == 'send':
         payload = message.get('payload')
-        if not isinstance(payload, dict):
-            print('[raw] ' + str(payload))
-            return
-        ptype = payload.get('type')
-        if ptype == 'network_event':
+        if isinstance(payload, dict) and payload.get('type') == 'network_event':
             handle_network_event(payload)
-        elif ptype == 'schannel_debug':
-            print(f"[DEBUG] {payload.get('api')} dir={payload.get('direction')} "
-                  f"buf[{payload.get('index')}] type={payload.get('bufType')} "
-                  f"len={payload.get('cbBuffer')}")
-        else:
-            print(json.dumps(payload, indent=2))
     elif message.get('type') == 'error':
         print('[frida error] ' + message.get('description', ''))
-        stack = message.get('stack', '')
-        if stack:
-            print(stack)
 
 
 def handle_network_event(evt):
@@ -604,74 +327,40 @@ def handle_network_event(evt):
     t = evt.get('timestamp', '')
 
     api = data.get('api', '?')
-    fd = data.get('fd', '?')
     length = data.get('length', '?')
-    ascii_preview = (data.get('ascii', '') or '')[:400]
+    ascii_str = data.get('ascii', '') or ''
+    ascii_preview = ascii_str[:400]
     hex_str = data.get('hex', '')
 
-    # Keep-list of events we always want to print
     keep_kinds = ('outgoing_schannel_plain', 'incoming_schannel_plain',
-                  'outgoing_tls', 'incoming_tls',
-                  'http_response_java', 'java_out',
                   'outgoing_winhttp', 'incoming_winhttp')
 
     if kind not in keep_kinds:
-        # Raw socket events — only keep if ASCII is clearly readable text
+        # Raw socket events — only keep readable text
         sample = ascii_preview[:64]
         if len(sample) < 8:
             return
         printable = sum(1 for c in sample if 32 <= ord(c) < 127 or c in ('\t', '\n', '\r'))
         if printable / len(sample) < 0.85:
             return
-        # Drop obvious TLS framing
         if hex_str[:6] in TLS_PREFIXES:
             return
 
     print('\n' + '=' * 78)
-    print(f'[{t}] {kind.upper():<26} {api}  fd={fd}  len={length}')
+    print(f'[{t}] {kind.upper():<26} {api}  len={length}')
     print('-' * 78)
 
     if ascii_preview:
         print('ASCII: ' + repr(ascii_preview))
 
-    if looks_like_json(data.get('ascii', '')):
+    if looks_like_json(ascii_str):
         try:
-            print('JSON (plaintext):')
-            print(json.dumps(json.loads(data.get('ascii', '')), indent=2)[:4000])
+            print('JSON:')
+            print(json.dumps(json.loads(ascii_str), indent=2)[:4000])
         except Exception:
             pass
 
-    if hex_str and HEX_RE.match(hex_str):
-        try:
-            raw = bytes.fromhex(hex_str)
-        except Exception:
-            raw = b''
 
-        if raw and not is_printable(raw):
-            print('[*] ciphertext (not printable) - attempting decryption...')
-            results = try_decrypt_blob(raw)
-            if results:
-                for scheme, pt in results:
-                    print(f'[+] DECRYPTED via {scheme}:')
-                    try:
-                        txt = pt.decode('utf-8', errors='replace')
-                    except Exception:
-                        txt = repr(pt)
-                    print('    ' + txt[:2000].replace('\n', '\n    '))
-                    if looks_like_json(txt):
-                        try:
-                            print('    JSON:')
-                            print('    ' + json.dumps(json.loads(txt), indent=2)
-                                  [:2000].replace('\n', '\n    '))
-                        except Exception:
-                            pass
-            else:
-                print('[*] no decryption succeeded with common schemes')
-
-
-# ---------------------------------------------------------------------------
-# Attach + monitor
-# ---------------------------------------------------------------------------
 def attach_and_monitor(device, proc, session_holder):
     print(f'\n[+] Attaching to {proc.name} (pid={proc.pid})')
     try:
@@ -695,9 +384,6 @@ def attach_and_monitor(device, proc, session_holder):
     return session
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 def main():
     print('[*] Acquiring device...')
     device = get_device()
@@ -705,19 +391,15 @@ def main():
 
     print('[*] Searching for processes matching "detect-fm"...')
     matches = find_detect_processes(device)
-
-    if matches:
-        for p in matches:
-            print(f'    - {p.name} (pid={p.pid})')
-    else:
-        print('[!] No matching processes found. Will keep polling.')
+    for p in matches:
+        print(f'    - {p.name} (pid={p.pid})')
 
     sessions = []
     for p in matches:
         attach_and_monitor(device, p, sessions)
 
     if not sessions:
-        print('[*] Polling every 2s for new "detect-fm" processes (Ctrl+C to quit)...')
+        print('[*] Polling every 2s (Ctrl+C to quit)...')
         known = set()
         try:
             while True:
