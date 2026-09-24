@@ -1,41 +1,61 @@
 #!/usr/bin/env python3
 """
-sspicli argument probe for detect-fm-<PIN>.exe.
+Capture decrypted TLS traffic from detect-fm-<PIN>.exe.
 
-Attaches to detect-fm, hooks ONLY sspicli/secur32/schannel EncryptMessage and
-DecryptMessage (system DLL exports — never touches the app's own module, so
-an integrity check of the app's .text will not fire). For each call it emits
-the six raw argument pointers plus the first two DWORDs at each one, which is
-enough to identify which argument carries the PSecBufferDesc.
-
-Waits for secur32.dll to load before resolving symbols.
+Hooks sspicli/secur32!EncryptMessage and DecryptMessage (system exports only
+— app module is never touched), parses the PSecBufferDesc correctly, and
+prints the plaintext HTTP/JSON before encryption and after decryption.
 """
 
 import frida
 import sys
 import time
 import json
+import re
 import psutil
+
+try:
+    from Crypto.Cipher import AES
+    HAVE_PYCRYPTO = True
+except ImportError:
+    HAVE_PYCRYPTO = False
 
 
 JS = r"""
 'use strict';
 
-var encCount = 0;
-var decCount = 0;
-
 function emit(p) { try { send(p); } catch (e) {} }
 
-function getExport(mod, sym) {
+function ts() { return new Date().toISOString(); }
+
+function bytesToHex(b) {
+    let s = '';
+    for (let i = 0; i < b.length; i++)
+        s += ('0' + (b[i] & 0xff).toString(16)).slice(-2);
+    return s;
+}
+
+function readMem(ptr, len) {
     try {
-        if (typeof Module.getExportByName === 'function')
-            return Module.getExportByName(mod, sym);
-    } catch (e) {}
+        if (!ptr || ptr.isNull() || len <= 0 || len > 0x100000) return null;
+        return new Uint8Array(ptr.readByteArray(len));
+    } catch (e) { return null; }
+}
+
+function u8ToStr(u8) {
     try {
-        if (typeof Module.findExportByName === 'function')
-            return Module.findExportByName(mod, sym);
-    } catch (e) {}
-    return null;
+        let s = '';
+        for (let i = 0; i < u8.length; i++) {
+            const c = u8[i];
+            if (c === 0) break;
+            s += String.fromCharCode(c);
+        }
+        return s;
+    } catch (e) { return ''; }
+}
+
+function emitEvent(kind, data) {
+    emit({ type: 'network_event', kind: kind, timestamp: ts(), data: data });
 }
 
 function getGlobalExport(sym) {
@@ -43,125 +63,137 @@ function getGlobalExport(sym) {
         if (typeof Module.findGlobalExportByName === 'function')
             return Module.findGlobalExportByName(sym);
     } catch (e) {}
-    try {
-        if (typeof Module.findExportByName === 'function')
-            return Module.findExportByName(null, sym);
-    } catch (e) {}
+    try { return Module.findExportByName(null, sym); } catch (e) {}
     return null;
 }
 
-function hint(p) {
-    try {
-        if (!p || p.isNull()) return 'null';
-        var a = p.readU32();
-        var b = p.add(4).readU32();
-        return '0x' + (a >>> 0).toString(16) + '/0x' + (b >>> 0).toString(16);
-    } catch (e) {
-        return '?';
-    }
+function getExport(mod, sym) {
+    try { return Module.getExportByName(mod, sym); } catch (e) {}
+    try { return Module.findExportByName(mod, sym); } catch (e) {}
+    return null;
 }
 
-function preview(p) {
+// Correct SecBufferDesc layout:
+//   +0  ULONG ulVersion    (usually 0)
+//   +4  ULONG cBuffers     (count)
+//   +8  PSecBuffer pBuffers (array of {cbBuffer, BufferType, pvBuffer})
+// SecBuffer on x64 is 16 bytes with padding.
+function parseSecBufferDesc(pDesc, api, direction) {
     try {
-        if (!p || p.isNull()) return '';
-        var s = p.readCString();
-        if (!s) return '';
-        var out = '';
-        for (var i = 0; i < s.length && i < 80; i++) {
-            var c = s.charCodeAt(i);
-            if (c < 32 || c > 126) break;
-            out += s.charAt(i);
+        if (!pDesc || pDesc.isNull()) return;
+        const ulVersion = pDesc.readU32();
+        const cBuffers  = pDesc.add(4).readU32();
+        if (cBuffers < 1 || cBuffers > 16) return;
+        const bufArray = pDesc.add(8).readPointer();
+        if (!bufArray || bufArray.isNull()) return;
+
+        const stride = 16;
+        for (let i = 0; i < cBuffers; i++) {
+            const entry = bufArray.add(i * stride);
+            let cbBuffer = 0, bufType = 0, pvBuffer = null;
+            try {
+                cbBuffer = entry.readU32();
+                bufType  = entry.add(4).readU32();
+                pvBuffer = entry.add(8).readPointer();
+            } catch (e) { continue; }
+
+            // 0x01 = SECBUFFER_DATA, 0x07 = SECBUFFER_STREAM
+            if (bufType !== 0x01 && bufType !== 0x07) continue;
+            if (cbBuffer === 0 || cbBuffer > 0x100000) continue;
+
+            const data = readMem(pvBuffer, cbBuffer);
+            if (!data) continue;
+
+            emitEvent(
+                direction === 'out' ? 'outgoing_schannel_plain'
+                                    : 'incoming_schannel_plain',
+                {
+                    api: api,
+                    length: cbBuffer,
+                    hex: bytesToHex(data),
+                    ascii: u8ToStr(data)
+                }
+            );
         }
-        return out;
-    } catch (e) { return ''; }
+    } catch (e) {}
 }
 
-function attachProbe(addr, where, kind) {
-    Interceptor.attach(addr, {
-        onEnter: function (args) {
-            var n = (kind === 'enc') ? (++encCount) : (++decCount);
-            if (n > 15) return;
-            var row = {
-                type: 'args',
-                kind: kind,
-                n: n,
-                where: where,
-                args: [],
-                hints: [],
-                previews: []
-            };
-            for (var i = 0; i < 6; i++) {
-                var p = args[i];
-                row.args.push(p ? p.toString() : '?');
-                row.hints.push(hint(p));
-                row.previews.push(preview(p));
-            }
-            emit(row);
-        }
-    });
-    console.log('[*] hooked ' + where + ' @ ' + addr);
-}
+let encCount = 0, decCount = 0;
 
-function hookProbe(symName, kind, fallbackOffset) {
-    // 1. Try every module that could export this function.
-    var mods = ['secur32.dll', 'sspicli.dll', 'schannel.dll'];
-    for (var i = 0; i < mods.length; i++) {
-        var a = getExport(mods[i], symName);
-        if (a) {
-            attachProbe(a, mods[i] + '!' + symName, kind);
-            return true;
-        }
+function hookSspi() {
+    // EncryptMessage(PCtxtHandle, ULONG, PSecBufferDesc, ULONG)
+    //   → args[2] is the PSecBufferDesc
+    const encAddr = getGlobalExport('EncryptMessage')
+                 || getExport('secur32.dll', 'EncryptMessage')
+                 || getExport('sspicli.dll', 'EncryptMessage');
+    if (encAddr) {
+        try {
+            Interceptor.attach(encAddr, {
+                onEnter(args) {
+                    encCount++;
+                    // On Encrypt, the DATA buffer holds plaintext here.
+                    parseSecBufferDesc(args[2], 'EncryptMessage', 'out');
+                }
+            });
+            console.log('[*] hooked EncryptMessage @ ' + encAddr);
+        } catch (e) { console.log('[!] hook EncryptMessage: ' + e); }
+    } else {
+        console.log('[!] EncryptMessage not resolved');
     }
-    // 2. Global lookup (across all loaded modules).
-    var g = getGlobalExport(symName);
-    if (g) {
-        attachProbe(g, 'global!' + symName, kind);
-        return true;
+
+    // DecryptMessage(PCtxtHandle, PSecBufferDesc, ULONG, PULONG)
+    //   → args[1] is the PSecBufferDesc
+    const decAddr = getGlobalExport('DecryptMessage')
+                 || getExport('secur32.dll', 'DecryptMessage')
+                 || getExport('sspicli.dll', 'DecryptMessage');
+    if (decAddr) {
+        try {
+            Interceptor.attach(decAddr, {
+                onEnter(args) {
+                    this.pDesc = args[1];
+                },
+                onLeave(retval) {
+                    // SEC_E_OK == 0; the plaintext is now in the DATA buffer.
+                    if (retval.toInt32() !== 0) return;
+                    decCount++;
+                    parseSecBufferDesc(this.pDesc, 'DecryptMessage', 'in');
+                }
+            });
+            console.log('[*] hooked DecryptMessage @ ' + decAddr);
+        } catch (e) { console.log('[!] hook DecryptMessage: ' + e); }
+    } else {
+        console.log('[!] DecryptMessage not resolved');
     }
-    // 3. Offset fallback inside sspicli.dll.
-    //    From prior v4 log:
-    //      secur32!EncryptMessage -> 0x7ff878532d70, sspicli base 0x7ff878530000
-    //      secur32!DecryptMessage -> 0x7ff878532cd0, sspicli base 0x7ff878530000
-    try {
-        var mod = null;
-        var names = ['sspicli.dll', 'SSPICLI.DLL', 'Secur32.dll', 'secur32.dll'];
-        for (var j = 0; j < names.length; j++) {
-            try { mod = Process.getModuleByName(names[j]); if (mod) break; } catch (e) {}
-        }
-        if (mod) {
-            var target = mod.base.add(fallbackOffset);
-            attachProbe(target, mod.name + '+0x' + fallbackOffset.toString(16)
-                              + ' (' + symName + ')', kind);
-            return true;
-        }
-    } catch (e) {
-        console.log('[!] offset fallback failed for ' + symName + ': ' + e);
-    }
-    console.log('[!] could not resolve ' + symName);
-    return false;
 }
 
 function waitForModule(name, cb, tries) {
     tries = tries || 0;
     try {
-        var m = Process.getModuleByName(name);
-        if (m) { cb(m); return; }
+        if (Process.getModuleByName(name)) { cb(); return; }
     } catch (e) {}
-    if (tries > 50) { console.log('[!] gave up waiting for ' + name); cb(null); return; }
+    if (tries > 50) { cb(); return; }
     setTimeout(function () { waitForModule(name, cb, tries + 1); }, 100);
 }
 
 setImmediate(function () {
-    console.log('[*] sspicli arg probe loaded (pid=' + Process.id +
-                ', arch=' + Process.arch + ')');
-    waitForModule('secur32.dll', function (m) {
-        if (m) console.log('[*] secur32.dll present @ ' + m.base);
-        hookProbe('EncryptMessage', 'enc', 0x2d70);
-        hookProbe('DecryptMessage', 'dec', 0x2cd0);
-        console.log('[*] probes installed');
+    console.log('[*] capture agent v6 loaded (pid=' + Process.id + ')');
+    waitForModule('secur32.dll', function () {
+        hookSspi();
+        console.log('[*] hooks installed');
     });
 });
 """
+
+
+def looks_like_json(s):
+    s = (s or '').strip()
+    if not s or s[0] not in '{[':
+        return False
+    try:
+        json.loads(s)
+        return True
+    except Exception:
+        return False
 
 
 def on_message(message, data):
@@ -172,20 +204,39 @@ def on_message(message, data):
     p = message.get('payload')
     if not isinstance(p, dict):
         return
-    if p.get('type') == 'args':
-        ts = time.strftime('%H:%M:%S')
-        kind = p.get('kind', '?').upper()
-        print('\n' + '=' * 78)
-        print(f'[{ts}] {kind} #{p.get("n")}  {p.get("where")}')
-        print('-' * 78)
-        args = p.get('args', [])
-        hints = p.get('hints', [''] * len(args))
-        previews = p.get('previews', [''] * len(args))
-        for i, a in enumerate(args):
-            line = f'  arg{i}: ptr={a}  head={hints[i]}'
-            if previews[i]:
-                line += f'  str="{previews[i]}"'
-            print(line)
+    if p.get('type') != 'network_event':
+        return
+
+    kind = p.get('kind', '')
+    data = p.get('data', {})
+    t = p.get('timestamp', '')
+    api = data.get('api', '?')
+    length = data.get('length', '?')
+    ascii_str = data.get('ascii', '') or ''
+
+    # Only print plaintext that looks like HTTP or JSON
+    printable_run = 0
+    max_run = 0
+    for ch in ascii_str[:256]:
+        c = ord(ch)
+        if 32 <= c < 127 or c in (9, 10, 13):
+            printable_run += 1
+            if printable_run > max_run: max_run = printable_run
+        else:
+            printable_run = 0
+    if max_run < 16:
+        return
+
+    print('\n' + '=' * 78)
+    print(f'[{t}] {kind.upper():<26} {api}  len={length}')
+    print('-' * 78)
+    print('ASCII: ' + repr(ascii_str[:600]))
+    if looks_like_json(ascii_str):
+        try:
+            print('JSON:')
+            print(json.dumps(json.loads(ascii_str), indent=2)[:4000])
+        except Exception:
+            pass
 
 
 def find_detect_processes():
@@ -225,11 +276,6 @@ def main():
     print(f'[*] Using device: {device}')
 
     existing = find_detect_processes()
-    if existing:
-        print('[*] Found existing processes:')
-        for e in existing:
-            print(f'    - {e["name"]} (pid={e["pid"]})')
-
     sessions = []
     for e in existing:
         r = attach_and_run(e['pid'], e['name'])
